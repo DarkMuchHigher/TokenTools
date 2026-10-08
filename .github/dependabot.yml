@@ -22,3 +22,5 @@ updates:
       time: "04:30"
       timezone: UTC
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"

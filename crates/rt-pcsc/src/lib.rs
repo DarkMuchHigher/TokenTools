@@ -61,7 +61,7 @@ impl Pcsc {
         };
         let mut lib = None;
         for name in candidates {
-            if let Ok(l) = unsafe { Library::new(name) } {
+            if let Ok(l) = unsafe { Library::new(*name) } {
                 lib = Some(l);
                 break;
             }

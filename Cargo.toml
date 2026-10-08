@@ -10,5 +10,5 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-libloading = "0.8"
+libloading = "0.9"
 clap = { version = "4", features = ["derive"] }
