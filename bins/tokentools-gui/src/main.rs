@@ -463,17 +463,9 @@ fn nav_item(ui: &mut egui::Ui, pal: &Palette, current: &mut Page, page: Page, la
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let app_icon = {
-            let img = image::load_from_memory(include_bytes!("../../../assets/app-icon.png"))
-                .expect("app-icon.png");
-            let rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            cc.egui_ctx.load_texture(
-                "app_icon",
-                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
-                egui::TextureOptions::LINEAR,
-            )
-        };
+        let app_icon =
+            cc.egui_ctx
+                .load_texture("app_icon", app_icon_image(), egui::TextureOptions::LINEAR);
         let dark = cc.egui_ctx.theme().eq(&egui::Theme::Dark);
         apply_theme(&cc.egui_ctx, dark);
         let (tx, rx) = channel();
@@ -1191,15 +1183,19 @@ impl eframe::App for App {
     }
 }
 
+const APP_ICON_SIZE: usize = 128;
+const APP_ICON_RGBA: &[u8] = include_bytes!("../../../assets/app-icon-128.rgba");
+const _: () = assert!(APP_ICON_RGBA.len() == APP_ICON_SIZE * APP_ICON_SIZE * 4);
+
+fn app_icon_image() -> egui::ColorImage {
+    egui::ColorImage::from_rgba_unmultiplied([APP_ICON_SIZE, APP_ICON_SIZE], APP_ICON_RGBA)
+}
+
 fn load_icon() -> egui::IconData {
-    let img =
-        image::load_from_memory(include_bytes!("../../../assets/app-icon.png")).expect("icon");
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
     egui::IconData {
-        rgba: rgba.into_raw(),
-        width: w,
-        height: h,
+        rgba: APP_ICON_RGBA.to_vec(),
+        width: APP_ICON_SIZE as u32,
+        height: APP_ICON_SIZE as u32,
     }
 }
 

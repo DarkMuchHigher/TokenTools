@@ -1,42 +1,199 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-#[derive(Parser)]
-#[command(
-    name = "rt-export",
-    version,
-    about = "TokenTools: выгрузка контейнеров с Рутокена (Tokens) + снятие неэкспортируемости (CertFix)"
-)]
-struct Cli {
-    #[arg(short, long, global = true)]
-    verbose: bool,
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-#[derive(Subcommand)]
+
+const USAGE: &str = "\
+TokenTools: выгрузка контейнеров с Рутокена (Tokens) + снятие неэкспортируемости (CertFix)
+
+Использование: rt-export [ОПЦИИ] <КОМАНДА>
+
+Команды:
+  list                 Считыватели PC/SC
+  doctor               Проверка окружения
+  dump <DEST>          Выгрузка контейнеров с токена [--pin PIN]
+  fix <DIR>            Снять флаг неэкспортируемости [--cert CERT]
+  verify <DIR>         Проверка контейнера через CryptoPro CSP
+  cert <DIR>           Извлечение сертификатов [--install]
+
+Опции:
+  -v, --verbose        Подробный вывод
+  -h, --help           Справка
+  -V, --version        Версия";
+
+#[derive(Debug, PartialEq)]
 enum Cmd {
     List,
     Doctor,
-    Dump {
-        dest: PathBuf,
-        #[arg(long)]
-        pin: Option<String>,
-    },
-    Fix {
-        dir: PathBuf,
-        #[arg(long)]
-        cert: Option<PathBuf>,
-    },
-    Verify {
-        dir: PathBuf,
-    },
-    Cert {
-        dir: PathBuf,
-        #[arg(long)]
-        install: bool,
-    },
+    Dump { dest: PathBuf, pin: Option<String> },
+    Fix { dir: PathBuf, cert: Option<PathBuf> },
+    Verify { dir: PathBuf },
+    Cert { dir: PathBuf, install: bool },
 }
+
+enum Parsed {
+    Run { verbose: bool, cmd: Cmd },
+    Help,
+    Version,
+}
+
+struct Parser<'a> {
+    args: &'a [String],
+    pos: usize,
+    verbose: bool,
+}
+
+impl<'a> Parser<'a> {
+    fn new(args: &'a [String], verbose: bool) -> Self {
+        Self {
+            args,
+            pos: 0,
+            verbose,
+        }
+    }
+    fn next(&mut self) -> Option<&'a str> {
+        let value = self.args.get(self.pos).map(String::as_str);
+        if value.is_some() {
+            self.pos += 1;
+        }
+        value
+    }
+    fn value_for(&mut self, flag: &str) -> Result<&'a str, String> {
+        self.next()
+            .ok_or_else(|| format!("для {flag} нужно значение"))
+    }
+}
+
+fn set_once<'a>(slot: &mut Option<&'a str>, value: &'a str, error: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{error}: {value}"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn no_args(p: &mut Parser<'_>, name: &str) -> Result<(), String> {
+    while let Some(arg) = p.next() {
+        if arg == "-v" || arg == "--verbose" {
+            p.verbose = true;
+            continue;
+        }
+        return Err(format!("{name}: лишний аргумент: {arg}"));
+    }
+    Ok(())
+}
+
+fn parse_args(args: &[String]) -> Result<Parsed, String> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(Parsed::Help);
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        return Ok(Parsed::Version);
+    }
+    let mut verbose = false;
+    let mut i = 0;
+    while matches!(args.get(i).map(String::as_str), Some("-v" | "--verbose")) {
+        verbose = true;
+        i += 1;
+    }
+    let name = args
+        .get(i)
+        .map(String::as_str)
+        .ok_or("команда не указана")?;
+    let mut p = Parser::new(&args[i + 1..], verbose);
+    let cmd = match name {
+        "list" => {
+            no_args(&mut p, "list")?;
+            Cmd::List
+        }
+        "doctor" => {
+            no_args(&mut p, "doctor")?;
+            Cmd::Doctor
+        }
+        "dump" => {
+            let mut dest = None;
+            let mut pin = None;
+            while let Some(arg) = p.next() {
+                match arg {
+                    "-v" | "--verbose" => p.verbose = true,
+                    "--pin" => pin = Some(p.value_for("--pin")?.to_string()),
+                    _ if arg.starts_with("--pin=") => pin = Some(arg["--pin=".len()..].to_string()),
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("dump: неизвестная опция: {arg}"));
+                    }
+                    _ => set_once(&mut dest, arg, "dump: лишний аргумент")?,
+                }
+            }
+            let dest = dest.ok_or("dump: не указан каталог: dump <DEST>")?;
+            Cmd::Dump {
+                dest: PathBuf::from(dest),
+                pin,
+            }
+        }
+        "fix" => {
+            let mut dir = None;
+            let mut cert = None;
+            while let Some(arg) = p.next() {
+                match arg {
+                    "-v" | "--verbose" => p.verbose = true,
+                    "--cert" => cert = Some(PathBuf::from(p.value_for("--cert")?)),
+                    _ if arg.starts_with("--cert=") => {
+                        cert = Some(PathBuf::from(&arg["--cert=".len()..]));
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("fix: неизвестная опция: {arg}"));
+                    }
+                    _ => set_once(&mut dir, arg, "fix: лишний аргумент")?,
+                }
+            }
+            let dir = dir.ok_or("fix: не указан каталог: fix <DIR>")?;
+            Cmd::Fix {
+                dir: PathBuf::from(dir),
+                cert,
+            }
+        }
+        "verify" => {
+            let mut dir = None;
+            while let Some(arg) = p.next() {
+                match arg {
+                    "-v" | "--verbose" => p.verbose = true,
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("verify: неизвестная опция: {arg}"));
+                    }
+                    _ => set_once(&mut dir, arg, "verify: лишний аргумент")?,
+                }
+            }
+            let dir = dir.ok_or("verify: не указан каталог: verify <DIR>")?;
+            Cmd::Verify {
+                dir: PathBuf::from(dir),
+            }
+        }
+        "cert" => {
+            let mut dir = None;
+            let mut install = false;
+            while let Some(arg) = p.next() {
+                match arg {
+                    "-v" | "--verbose" => p.verbose = true,
+                    "--install" => install = true,
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("cert: неизвестная опция: {arg}"));
+                    }
+                    _ => set_once(&mut dir, arg, "cert: лишний аргумент")?,
+                }
+            }
+            let dir = dir.ok_or("cert: не указан каталог: cert <DIR>")?;
+            Cmd::Cert {
+                dir: PathBuf::from(dir),
+                install,
+            }
+        }
+        other => return Err(format!("неизвестная команда: {other}")),
+    };
+    Ok(Parsed::Run {
+        verbose: p.verbose,
+        cmd,
+    })
+}
+
 fn now_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -45,11 +202,32 @@ fn now_nanos() -> u128 {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.cmd {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed = match parse_args(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    match parsed {
+        Parsed::Help => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Parsed::Version => {
+            println!("rt-export {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Parsed::Run { verbose, cmd } => run(verbose, cmd),
+    }
+}
+
+fn run(verbose: bool, cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::List => cmd_list(),
         Cmd::Doctor => cmd_doctor(),
-        Cmd::Dump { dest, pin } => cmd_dump(&dest, cli.verbose, pin.as_deref()),
+        Cmd::Dump { dest, pin } => cmd_dump(&dest, verbose, pin.as_deref()),
         Cmd::Fix { dir, cert } => cmd_fix(&dir, cert),
         Cmd::Verify { dir } => cmd_verify(&dir),
         Cmd::Cert { dir, install } => cmd_cert(&dir, install),
@@ -299,4 +477,89 @@ fn cmd_cert(dir: &Path, install: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Parsed, String> {
+        parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn parses_global_verbose_before_command() {
+        let Ok(Parsed::Run { verbose, cmd }) = parse(&["--verbose", "list"]) else {
+            panic!("должно разобраться");
+        };
+        assert!(verbose);
+        assert_eq!(cmd, Cmd::List);
+    }
+
+    #[test]
+    fn parses_dump_with_pin() {
+        let Ok(Parsed::Run { cmd, .. }) = parse(&["dump", "./out", "--pin", "87654321"]) else {
+            panic!("должно разобраться");
+        };
+        assert_eq!(
+            cmd,
+            Cmd::Dump {
+                dest: PathBuf::from("./out"),
+                pin: Some("87654321".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pin_equals_form() {
+        let Ok(Parsed::Run { cmd, .. }) = parse(&["dump", "--pin=1234", "./out"]) else {
+            panic!("должно разобраться");
+        };
+        assert_eq!(
+            cmd,
+            Cmd::Dump {
+                dest: PathBuf::from("./out"),
+                pin: Some("1234".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_cert_install_and_fix_cert() {
+        let Ok(Parsed::Run { cmd, .. }) = parse(&["cert", "./c", "--install"]) else {
+            panic!("должно разобраться");
+        };
+        assert_eq!(
+            cmd,
+            Cmd::Cert {
+                dir: PathBuf::from("./c"),
+                install: true
+            }
+        );
+        let Ok(Parsed::Run { cmd, .. }) = parse(&["fix", "./c", "--cert", "./cert.cer"]) else {
+            panic!("должно разобраться");
+        };
+        assert_eq!(
+            cmd,
+            Cmd::Fix {
+                dir: PathBuf::from("./c"),
+                cert: Some(PathBuf::from("./cert.cer"))
+            }
+        );
+    }
+
+    #[test]
+    fn help_and_version_win_over_parsing() {
+        assert!(matches!(parse(&["dump", "--help"]), Ok(Parsed::Help)));
+        assert!(matches!(parse(&["-V"]), Ok(Parsed::Version)));
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!(parse(&["frobnicate"]).is_err());
+        assert!(parse(&["dump"]).is_err());
+        assert!(parse(&["verify", "a", "b"]).is_err());
+        assert!(parse(&["dump", "./out", "--pin"]).is_err());
+        assert!(parse(&["list", "extra"]).is_err());
+    }
 }

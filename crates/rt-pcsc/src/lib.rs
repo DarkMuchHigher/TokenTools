@@ -1,7 +1,124 @@
 use anyhow::{anyhow, bail, Result};
-use libloading::Library;
 use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
+
+mod dynlib {
+    use std::ffi::c_void;
+
+    #[cfg(unix)]
+    mod imp {
+        use std::ffi::{c_char, c_int, c_void};
+
+        const RTLD_NOW: c_int = 2;
+
+        extern "C" {
+            fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> c_int;
+            fn dlerror() -> *mut c_char;
+        }
+
+        pub unsafe fn open(name: &str) -> Result<*mut c_void, String> {
+            let name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
+            let handle = dlopen(name.as_ptr(), RTLD_NOW);
+            if handle.is_null() {
+                Err(last_error())
+            } else {
+                Ok(handle)
+            }
+        }
+
+        pub unsafe fn symbol(handle: *mut c_void, name: &[u8]) -> Result<*mut c_void, String> {
+            let symbol = dlsym(handle, name.as_ptr() as *const c_char);
+            if symbol.is_null() {
+                Err(last_error())
+            } else {
+                Ok(symbol)
+            }
+        }
+
+        pub unsafe fn close(handle: *mut c_void) {
+            dlclose(handle);
+        }
+
+        unsafe fn last_error() -> String {
+            let error = dlerror();
+            if error.is_null() {
+                "неизвестная ошибка динамической загрузки".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(error)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod imp {
+        use std::ffi::c_void;
+
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+            fn FreeLibrary(module: *mut c_void) -> i32;
+        }
+
+        pub unsafe fn open(name: &str) -> Result<*mut c_void, String> {
+            let mut name = name.as_bytes().to_vec();
+            name.push(0);
+            let handle = LoadLibraryA(name.as_ptr());
+            if handle.is_null() {
+                Err(format!("LoadLibraryA: {}", name_display(&name)))
+            } else {
+                Ok(handle)
+            }
+        }
+
+        pub unsafe fn symbol(handle: *mut c_void, name: &[u8]) -> Result<*mut c_void, String> {
+            let symbol = GetProcAddress(handle, name.as_ptr());
+            if symbol.is_null() {
+                Err(format!("GetProcAddress: {}", name_display(name)))
+            } else {
+                Ok(symbol)
+            }
+        }
+
+        pub unsafe fn close(handle: *mut c_void) {
+            FreeLibrary(handle);
+        }
+
+        fn name_display(name: &[u8]) -> String {
+            let name = name.strip_suffix(&[0]).unwrap_or(name);
+            String::from_utf8_lossy(name).into_owned()
+        }
+    }
+
+    pub struct Dl {
+        handle: *mut c_void,
+    }
+
+    impl Dl {
+        pub fn open(name: &str) -> anyhow::Result<Self> {
+            unsafe { imp::open(name) }
+                .map(|handle| Self { handle })
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+
+        pub unsafe fn symbol<T: Copy>(&self, name: &[u8]) -> anyhow::Result<T> {
+            let symbol = imp::symbol(self.handle, name).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(std::mem::transmute_copy(&symbol))
+        }
+    }
+
+    impl Drop for Dl {
+        fn drop(&mut self) {
+            unsafe { imp::close(self.handle) }
+        }
+    }
+
+    unsafe impl Send for Dl {}
+    unsafe impl Sync for Dl {}
+}
 type ScardContext = usize;
 type ScardHandle = usize;
 type Long = i32;
@@ -44,7 +161,7 @@ fn scard_err(what: &str, rc: Long) -> anyhow::Error {
     anyhow!("{what}: SCard error 0x{:08x}", rc as u32)
 }
 pub struct Pcsc {
-    _lib: Library,
+    _lib: dynlib::Dl,
     establish: FnEstablish,
     release: FnRelease,
     list_readers: FnListReaders,
@@ -61,8 +178,8 @@ impl Pcsc {
         };
         let mut lib = None;
         for name in candidates {
-            if let Ok(l) = unsafe { Library::new(*name) } {
-                lib = Some(l);
+            if let Ok(candidate) = dynlib::Dl::open(name) {
+                lib = Some(candidate);
                 break;
             }
         }
@@ -70,12 +187,12 @@ impl Pcsc {
             anyhow!("не удалось загрузить библиотеку PC/SC (искали: {candidates:?})")
         })?;
         unsafe {
-            let establish = *lib.get::<FnEstablish>(b"SCardEstablishContext\0")?;
-            let release = *lib.get::<FnRelease>(b"SCardReleaseContext\0")?;
-            let list_readers = *lib.get::<FnListReaders>(b"SCardListReaders\0")?;
-            let connect = *lib.get::<FnConnect>(b"SCardConnect\0")?;
-            let disconnect = *lib.get::<FnDisconnect>(b"SCardDisconnect\0")?;
-            let transmit = *lib.get::<FnTransmit>(b"SCardTransmit\0")?;
+            let establish = lib.symbol::<FnEstablish>(b"SCardEstablishContext\0")?;
+            let release = lib.symbol::<FnRelease>(b"SCardReleaseContext\0")?;
+            let list_readers = lib.symbol::<FnListReaders>(b"SCardListReaders\0")?;
+            let connect = lib.symbol::<FnConnect>(b"SCardConnect\0")?;
+            let disconnect = lib.symbol::<FnDisconnect>(b"SCardDisconnect\0")?;
+            let transmit = lib.symbol::<FnTransmit>(b"SCardTransmit\0")?;
             Ok(Arc::new(Self {
                 _lib: lib,
                 establish,

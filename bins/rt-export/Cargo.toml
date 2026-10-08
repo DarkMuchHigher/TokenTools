@@ -8,7 +8,6 @@ description = "CLI TokenTools: выгрузка контейнеров с Рут
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 rt-pcsc = { path = "../../crates/rt-pcsc" }
 rt-fs = { path = "../../crates/rt-fs" }
 cryptopro-container = { path = "../../crates/cryptopro-container" }

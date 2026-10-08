@@ -8,4 +8,3 @@ description = "PC/SC транспорт для токенов Рутокен (д
 
 [dependencies]
 anyhow.workspace = true
-libloading.workspace = true
