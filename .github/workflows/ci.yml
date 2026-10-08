@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-24.04, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Linux GUI dependencies
         if: startsWith(matrix.os, 'ubuntu')
@@ -83,7 +83,7 @@ jobs:
             artifact: windows-x86_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Linux GUI dependencies
         if: startsWith(matrix.os, 'ubuntu')
@@ -136,7 +136,7 @@ jobs:
           Remove-Item -Recurse -Force $dir
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TokenTools-${{ matrix.artifact }}
           path: dist/
@@ -152,7 +152,7 @@ jobs:
       contents: write
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
