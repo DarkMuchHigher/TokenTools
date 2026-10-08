@@ -1,0 +1,12 @@
+[package]
+name = "certfix-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "../../README.md"
+description = "CertFix: снятие неэкспортируемости (p12utility под Wine) + обёртки КриптоПро CSP"
+
+[dependencies]
+anyhow.workspace = true
+cryptopro-container = { path = "../cryptopro-container" }
+rt-pcsc = { path = "../rt-pcsc" }

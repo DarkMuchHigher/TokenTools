@@ -1,0 +1,15 @@
+[package]
+name = "rt-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "../../README.md"
+description = "CLI TokenTools: выгрузка контейнеров с Рутокена и снятие неэкспортируемости"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rt-pcsc = { path = "../../crates/rt-pcsc" }
+rt-fs = { path = "../../crates/rt-fs" }
+cryptopro-container = { path = "../../crates/cryptopro-container" }
+certfix-core = { path = "../../crates/certfix-core" }

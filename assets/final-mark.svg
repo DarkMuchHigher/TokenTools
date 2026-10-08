@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <title>TokenTools</title>
+  <path fill="#000" fill-rule="evenodd" d="
+    M 56 88
+    h 52
+    a 16 16 0 0 1 16 16
+    v 36
+    a 16 16 0 0 1 -16 16
+    h -52
+    a 16 16 0 0 1 -16 -16
+    v -36
+    a 16 16 0 0 1 16 -16
+    Z
+    M 82 108
+    a 14 14 0 1 0 0 28
+    a 14 14 0 1 0 0 -28
+    Z"/>
+  <rect x="108" y="115" width="104" height="26" fill="#000"/>
+  <rect x="152" y="141" width="16" height="30" fill="#000"/>
+  <rect x="182" y="141" width="16" height="30" fill="#000"/>
+</svg>

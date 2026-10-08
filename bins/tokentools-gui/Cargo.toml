@@ -1,0 +1,16 @@
+[package]
+name = "tokentools-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "../../README.md"
+description = "GUI TokenTools: выгрузка контейнеров с Рутокена и снятие неэкспортируемости"
+
+[dependencies]
+eframe = { version = "0.36", features = ["glow"] }
+egui = "0.36"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rt-pcsc = { path = "../../crates/rt-pcsc" }
+rt-fs = { path = "../../crates/rt-fs" }
+cryptopro-container = { path = "../../crates/cryptopro-container" }
+certfix-core = { path = "../../crates/certfix-core" }

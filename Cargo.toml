@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+libloading = "0.8"
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,11 @@
+[package]
+name = "rt-pcsc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "../../README.md"
+description = "PC/SC транспорт для токенов Рутокен (динамическая загрузка libpcsclite)"
+
+[dependencies]
+anyhow.workspace = true
+libloading.workspace = true
