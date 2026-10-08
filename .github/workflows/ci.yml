@@ -136,7 +136,7 @@ jobs:
           Remove-Item -Recurse -Force $dir
 
       - name: Upload packaged artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TokenTools-${{ matrix.artifact }}
           path: dist/
