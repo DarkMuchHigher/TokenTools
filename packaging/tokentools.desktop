@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=TokenTools
-Comment=Контейнеры КриптоПро на Рутокенах
+Comment=Контейнеры КриптоПро на аппаратных токенах
 Exec=tokentools-gui
 Icon=tokentools
 Terminal=false

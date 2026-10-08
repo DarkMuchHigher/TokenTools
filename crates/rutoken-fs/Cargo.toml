@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "../../README.md"
-description = "Обход файловой системы Рутокена по APDU"
+description = "Обход файловой системы токена по APDU"
 
 [dependencies]
 anyhow.workspace = true

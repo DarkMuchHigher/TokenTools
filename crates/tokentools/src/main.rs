@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "\
-TokenTools: выгрузка контейнеров с Рутокена (Tokens) + снятие неэкспортируемости (CertFix)
+TokenTools: выгрузка контейнеров с токена (Tokens) + снятие неэкспортируемости (CertFix)
 
 Использование: tokentools [ОПЦИИ] <КОМАНДА>
 
@@ -315,7 +315,12 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                 continue;
             }
         };
-        let fs = rutoken_fs::RutokenFs::new(&card, verbose);
+        let log_sink = |msg: &str| {
+            if verbose {
+                println!("    [fs] {msg}");
+            }
+        };
+        let fs = rutoken_fs::RutokenFs::new(&card, Some(&log_sink));
         match fs.authenticate_user_pin(&pin) {
             Ok(outcome) if outcome.already_authenticated => {
                 println!("  PIN: сессия уже авторизована");

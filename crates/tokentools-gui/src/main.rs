@@ -19,6 +19,21 @@ enum Level {
     Info,
     Ok,
     Err,
+    Trace,
+}
+
+fn now_hms() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    format!(
+        "{:02}:{:02}:{:02}.{:03}Z",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60,
+        now.subsec_millis()
+    )
 }
 
 #[derive(Clone)]
@@ -499,7 +514,11 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
                 continue;
             }
         };
-        let fs = rutoken_fs::RutokenFs::new(&card, false);
+        let log_tx = tx.clone();
+        let log_sink = move |msg: &str| {
+            let _ = log_tx.send(Msg::Log(Level::Trace, format!("  {msg}")));
+        };
+        let fs = rutoken_fs::RutokenFs::new(&card, Some(&log_sink));
         match fs.authenticate_user_pin(&pin) {
             Ok(outcome) => {
                 let text = if outcome.already_authenticated {
@@ -717,6 +736,7 @@ impl App {
 
     fn log(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
+        let time = now_hms();
         if let Some(dir) = log_dir() {
             let _ = std::fs::create_dir_all(&dir);
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -726,14 +746,15 @@ impl App {
             {
                 use std::io::Write;
                 let mark = match level {
-                    Level::Info => "--",
-                    Level::Ok => "OK",
-                    Level::Err => "!!",
+                    Level::Info => "INF",
+                    Level::Ok => "OK ",
+                    Level::Err => "ERR",
+                    Level::Trace => "TRC",
                 };
-                let _ = writeln!(f, "{mark} {text}");
+                let _ = writeln!(f, "{time} {mark} {text}");
             }
         }
-        self.log.push((level, text));
+        self.log.push((level, format!("{time}  {text}")));
         if self.log.len() > 2000 {
             self.log.drain(0..self.log.len() - 2000);
         }
@@ -1468,6 +1489,7 @@ impl App {
                             Level::Info => palette.text,
                             Level::Ok => palette.ok,
                             Level::Err => palette.err,
+                            Level::Trace => palette.muted,
                         };
                         ui.label(egui::RichText::new(line).color(color).size(13.0));
                     }

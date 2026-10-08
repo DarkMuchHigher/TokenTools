@@ -301,14 +301,14 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
     } else {
         bail!("Wine не найден: установите flatpak org.winehq.Wine//wow64-25.08 (или wine)");
     }
-    let out = cmd
-        .args(["--cprepair", "--container_folder", ".", "--cert"])
+    cmd.args(["--cprepair", "--container_folder", ".", "--cert"])
         .arg(&cert)
         .arg("--keyexport")
-        .current_dir(&container_dir)
-        .output()
-        .context("не удалось запустить p12utility")?;
-    let mut text = decode_csp_output(&out.stdout);
+        .current_dir(&container_dir);
+    let command_line = describe_command(&cmd);
+    let out = cmd.output().context("не удалось запустить p12utility")?;
+    let mut text = format!("$ {command_line}\n");
+    text.push_str(&decode_csp_output(&out.stdout));
     text.push_str(&decode_csp_output(&out.stderr));
     let succeeded = out.status.success()
         && (contains_success_marker(&out.stdout)
@@ -330,6 +330,19 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
     }
     text.push_str(&format!("\nBackup: {}\n", backup.display()));
     Ok(text)
+}
+
+fn describe_command(cmd: &Command) -> String {
+    let mut parts = vec![cmd.get_program().to_string_lossy().into_owned()];
+    for arg in cmd.get_args() {
+        let arg = arg.to_string_lossy();
+        if arg.contains(' ') {
+            parts.push(format!("\"{arg}\""));
+        } else {
+            parts.push(arg.into_owned());
+        }
+    }
+    parts.join(" ")
 }
 
 fn find_csp_tool(name: &str) -> Result<PathBuf> {
@@ -383,12 +396,13 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
         );
     }
     if cfg!(target_os = "windows") {
-        let out = Command::new(find_csp_tool("csptest")?)
-            .args(["-keyset", "-check", "-container"])
-            .arg(&container_dir)
-            .output()
-            .context("не удалось запустить csptest")?;
-        let mut text = decode_csp_output(&out.stdout);
+        let mut cmd = Command::new(find_csp_tool("csptest")?);
+        cmd.args(["-keyset", "-check", "-container"])
+            .arg(&container_dir);
+        let command_line = describe_command(&cmd);
+        let out = cmd.output().context("не удалось запустить csptest")?;
+        let mut text = format!("$ {command_line}\n");
+        text.push_str(&decode_csp_output(&out.stdout));
         text.push_str(&decode_csp_output(&out.stderr));
         if !out.status.success() {
             bail!("csptest завершился с ошибкой\n{text}");
@@ -416,14 +430,14 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
     let Some((name, tmp)) = tmp else {
         bail!("не удалось подобрать уникальное имя временного CSP-контейнера");
     };
+    let mut cmd = Command::new(find_csp_tool("csptest")?);
+    cmd.args(["-keyset", "-check", "-container"])
+        .arg(format!("\\\\.\\hdimage\\{name}"));
+    let command_line = describe_command(&cmd);
     let result = (|| -> Result<std::process::Output> {
         copy_container(&container_dir, &tmp)?;
         std::fs::write(tmp.join("name.key"), build_name_key(name.as_bytes()))?;
-        Command::new(find_csp_tool("csptest")?)
-            .args(["-keyset", "-check", "-container"])
-            .arg(format!("\\\\.\\hdimage\\{name}"))
-            .output()
-            .context("не удалось запустить csptest")
+        cmd.output().context("не удалось запустить csptest")
     })();
     let cleanup = std::fs::remove_dir_all(&tmp);
     let out = result?;
@@ -433,7 +447,8 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
             tmp.display()
         );
     }
-    let mut text = decode_csp_output(&out.stdout);
+    let mut text = format!("$ {command_line}\n");
+    text.push_str(&decode_csp_output(&out.stdout));
     text.push_str(&decode_csp_output(&out.stderr));
     if !out.status.success() {
         bail!("csptest завершился с ошибкой\n{text}");
@@ -452,8 +467,10 @@ pub fn certmgr_install(
         cmd.args(["-container", c]);
     }
     cmd.args(["-store", store]);
+    let command_line = describe_command(&cmd);
     let output = cmd.output().context("не удалось запустить certmgr")?;
-    let mut text = decode_csp_output(&output.stdout);
+    let mut text = format!("$ {command_line}\n");
+    text.push_str(&decode_csp_output(&output.stdout));
     text.push_str(&decode_csp_output(&output.stderr));
     Ok((text, output.status.success()))
 }
@@ -477,7 +494,7 @@ pub fn certmgr_list(store: &str) -> Result<Vec<StoreCert>> {
         .context("не удалось запустить certmgr")?;
     let text = decode_csp_output(&output.stdout);
     if !output.status.success() && !text.contains("-------") {
-        bail!("certmgr завершился с ошибкой");
+        bail!("certmgr завершился с ошибкой: $ certmgr -list -store {store}");
     }
     Ok(parse_certmgr_list(&text))
 }

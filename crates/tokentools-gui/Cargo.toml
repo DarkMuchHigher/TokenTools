@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "../../README.md"
-description = "GUI TokenTools: выгрузка контейнеров с Рутокена и снятие неэкспортируемости"
+description = "GUI TokenTools: выгрузка контейнеров с токена и снятие неэкспортируемости"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = [

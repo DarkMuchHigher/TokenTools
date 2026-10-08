@@ -27,6 +27,26 @@ fn verify_apdu(pin_ref: u8, pin: &[u8]) -> Vec<u8> {
     apdu
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trace_apdu_text(apdu: &[u8]) -> String {
+    let secret = matches!(apdu.get(1), Some(0x20 | 0x24));
+    if secret && apdu.len() > 5 {
+        let masked = std::iter::repeat_n("**", apdu.len() - 5)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {masked}", hex(&apdu[..5]))
+    } else {
+        hex(apdu)
+    }
+}
+
 fn pin_state_from_sw(sw: u16) -> Option<PinState> {
     match sw {
         0x9000 => Some(PinState::Authenticated),
@@ -65,16 +85,32 @@ fn parse_tlv(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
 }
 pub struct RutokenFs<'a> {
     card: &'a Card,
-    verbose: bool,
+    log: Option<&'a dyn Fn(&str)>,
 }
 impl<'a> RutokenFs<'a> {
-    pub fn new(card: &'a Card, verbose: bool) -> Self {
-        Self { card, verbose }
+    pub fn new(card: &'a Card, log: Option<&'a dyn Fn(&str)>) -> Self {
+        Self { card, log }
     }
     fn log(&self, msg: &str) {
-        if self.verbose {
-            println!("    [fs] {msg}");
+        if let Some(log) = self.log {
+            log(msg);
         }
+    }
+    fn transmit(&self, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
+        self.log(&format!("-> {}", trace_apdu_text(apdu)));
+        let (data, sw) = self.card.transmit(apdu)?;
+        let shown = if data.len() > 24 {
+            format!("{}…", hex(&data[..24]))
+        } else {
+            hex(&data)
+        };
+        let size = if data.is_empty() {
+            String::new()
+        } else {
+            format!(" · {} байт", data.len())
+        };
+        self.log(&format!("<- {shown} SW={sw:04x}{size}"));
+        Ok((data, sw))
     }
     fn select_raw(&self, p1: u8, p2: u8, data: &[u8], le: u8) -> Result<(Vec<u8>, u16)> {
         let mut apdu = vec![0x00, 0xA4, p1, p2];
@@ -83,7 +119,7 @@ impl<'a> RutokenFs<'a> {
             apdu.extend_from_slice(data);
         }
         apdu.push(le);
-        self.card.transmit(&apdu)
+        self.transmit(&apdu)
     }
     fn select_first(&self) -> Result<(Vec<u8>, u16)> {
         self.select_raw(0x00, 0x00, &[], 0)
@@ -105,8 +141,7 @@ impl<'a> RutokenFs<'a> {
         while length > 0 {
             let n = length.min(256);
             let (resp, sw) =
-                self.card
-                    .transmit(&[0x00, 0xB0, (offset >> 8) as u8, offset as u8, n as u8])?;
+                self.transmit(&[0x00, 0xB0, (offset >> 8) as u8, offset as u8, n as u8])?;
             if sw != 0x9000 {
                 bail!("READ BINARY @{offset}: SW={sw:04x}");
             }
@@ -133,14 +168,14 @@ impl<'a> RutokenFs<'a> {
         self.read_binary(0, length)
     }
     pub fn pin_state(&self, pin_ref: u8) -> Result<PinState> {
-        let (_, sw) = self.card.transmit(&[0x00, 0x20, 0x00, pin_ref])?;
+        let (_, sw) = self.transmit(&[0x00, 0x20, 0x00, pin_ref])?;
         pin_state_from_sw(sw).ok_or_else(|| anyhow!("VERIFY: неожиданный SW={sw:04x}"))
     }
     pub fn verify_pin(&self, pin_ref: u8, pin: &[u8]) -> Result<u16> {
         if pin.is_empty() || pin.len() > 255 {
             bail!("некорректная длина PIN ({} байт)", pin.len());
         }
-        let (_, sw) = self.card.transmit(&verify_apdu(pin_ref, pin))?;
+        let (_, sw) = self.transmit(&verify_apdu(pin_ref, pin))?;
         Ok(sw)
     }
     pub fn authenticate_user_pin(&self, pin: &str) -> Result<AuthOutcome> {
@@ -150,7 +185,7 @@ impl<'a> RutokenFs<'a> {
             }),
             PinState::TriesLeft(0) => bail!(
                 "PIN пользователя заблокирован: попыток не осталось \
-                 (разблокировка — через Панель управления Рутокен или админ-PIN)"
+                 (разблокировка — через панель управления токеном или админ-PIN)"
             ),
             PinState::TriesLeft(tries) => match self.verify_pin(PIN_REF_USER, pin.as_bytes())? {
                 0x9000 => Ok(AuthOutcome {
@@ -299,6 +334,19 @@ mod tests {
             vec![
                 0x00, 0x20, 0x00, 0x02, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8'
             ]
+        );
+    }
+
+    #[test]
+    fn trace_masks_pin_bytes() {
+        let apdu = verify_apdu(PIN_REF_USER, b"12345678");
+        assert_eq!(
+            trace_apdu_text(&apdu),
+            "00 20 00 02 08 ** ** ** ** ** ** ** **"
+        );
+        assert_eq!(
+            trace_apdu_text(&[0x00, 0xA4, 0x00, 0x00, 0x02, 0x00, 0x3F, 0x00]),
+            "00 A4 00 00 02 00 3F 00"
         );
     }
 
