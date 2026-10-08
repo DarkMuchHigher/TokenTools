@@ -39,7 +39,7 @@ cargo build --workspace --release --locked
 ### Проверка окружения
 
 ```bash
-cargo run --release -p rt-export -- doctor
+cargo run --release -p tokentools -- doctor
 ```
 
 Команда показывает состояние PC/SC, считывателей, Wine/Flatpak, `p12utility`, `csptest` и `certmgr`.
@@ -48,28 +48,31 @@ cargo run --release -p rt-export -- doctor
 
 ```bash
 # Список считывателей
-cargo run --release -p rt-export -- list
+cargo run --release -p tokentools -- list
 
 # Выгрузка контейнеров
-cargo run --release -p rt-export -- dump ./dump
+cargo run --release -p tokentools -- dump ./dump
 
 # Выгрузка с явным PIN
-cargo run --release -p rt-export -- dump ./dump --pin 87654321
+cargo run --release -p tokentools -- dump ./dump --pin 87654321
 
 # Подробный вывод обхода файловой системы
-cargo run --release -p rt-export -- --verbose dump ./dump
+cargo run --release -p tokentools -- --verbose dump ./dump
 
 # Проверка контейнера
-cargo run --release -p rt-export -- verify ./dump/<container>
+cargo run --release -p tokentools -- verify ./dump/<container>
 
 # Извлечение сертификатов
-cargo run --release -p rt-export -- cert ./dump/<container>
+cargo run --release -p tokentools -- cert ./dump/<container>
+
+# Состав сертификатов, отпечатки SHA-1/SHA-256 и PEM
+cargo run --release -p tokentools -- cert ./dump/<container> --show --pem
 
 # Извлечение и установка сертификатов
-cargo run --release -p rt-export -- cert ./dump/<container> --install
+cargo run --release -p tokentools -- cert ./dump/<container> --install
 
 # CertFix-процесс
-cargo run --release -p rt-export -- fix ./dump/<container>
+cargo run --release -p tokentools -- fix ./dump/<container>
 ```
 
 Если `p12utility.win32.exe` не находится автоматически:
@@ -104,17 +107,19 @@ export TOKENTOOLS_PIN=87654321
 cargo run --release -p tokentools-gui
 ```
 
-Разделы интерфейса: **Устройства**, **Контейнер** и **Журнал**. PIN вводится в разделе «Устройства»; после неверного PIN автопоиск приостанавливается до нажатия «Обновить».
+Разделы интерфейса: **Устройства**, **Контейнер**, **Сертификаты** и **Журнал**. PIN вводится в разделе «Устройства»; после неверного PIN автопоиск приостанавливается до нажатия «Обновить». В разделе «Сертификаты» — личные сертификаты КриптоПро из хранилища `uMy` с поиском.
+
+Иконка в доке и меню (Linux): скопируйте `tokentools.desktop` в `~/.local/share/applications/`, а `tokentools.png` в `~/.local/share/icons/hicolor/128x128/apps/`. В релизных архивах оба файла лежат рядом с бинарниками.
 
 ## Workspace
 
 | Пакет | Назначение |
 | --- | --- |
-| `rt-pcsc` | PC/SC-транспорт для Linux и Windows. |
-| `rt-fs` | APDU-выбор, перечисление файлов и чтение данных Рутокена. |
+| `pcsc-transport` | PC/SC-транспорт: динамическая загрузка libpcsclite / winscard. |
+| `rutoken-fs` | APDU-выбор, перечисление файлов и чтение данных Рутокена. |
 | `cryptopro-container` | Разбор имён, `header.key` и сертификатов. |
-| `certfix-core` | CryptoPro CSP, Wine/Flatpak, проверка и обработка контейнеров. |
-| `rt-export` | CLI: `list`, `doctor`, `dump`, `fix`, `verify`, `cert`. |
+| `certfix` | CryptoPro CSP, Wine/Flatpak, проверка и обработка контейнеров. |
+| `tokentools` | CLI: `list`, `doctor`, `dump`, `fix`, `verify`, `cert`. |
 | `tokentools-gui` | Desktop-интерфейс на egui/eframe. |
 
 ## Окружение

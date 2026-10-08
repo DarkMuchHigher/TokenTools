@@ -1,10 +1,10 @@
 [package]
-name = "rt-pcsc"
+name = "pcsc-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 readme = "../../README.md"
-description = "PC/SC транспорт для токенов Рутокен (динамическая загрузка libpcsclite)"
+description = "PC/SC-транспорт: динамическая загрузка libpcsclite / winscard"
 
 [dependencies]
 anyhow.workspace = true

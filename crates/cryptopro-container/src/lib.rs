@@ -1,5 +1,10 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::Path;
+
+mod x509;
+
+pub use x509::{CertInfo, parse_cert, to_pem};
+
 pub const CONTAINER_FILES: [&str; 6] = [
     "name.key",
     "header.key",
@@ -53,7 +58,7 @@ pub fn cp1251_to_string(bytes: &[u8]) -> String {
         })
         .collect()
 }
-fn parse_tlv_sequence(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+pub(crate) fn parse_tlv_sequence(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 1 < data.len() {
@@ -110,12 +115,12 @@ pub fn build_name_key(name: &[u8]) -> Vec<u8> {
     out
 }
 #[derive(Debug, Default, Clone)]
-pub struct Certs {
+pub struct ContainerCerts {
     pub owner: Vec<u8>,
     pub chain: Vec<Vec<u8>>,
 }
-fn header_certs(header: &[u8]) -> Certs {
-    let mut out = Certs::default();
+fn header_certs(header: &[u8]) -> ContainerCerts {
+    let mut out = ContainerCerts::default();
     let outer = if !header.is_empty() && header[0] == 0x30 {
         tlv_content(header).to_vec()
     } else {
@@ -162,7 +167,7 @@ fn header_certs(header: &[u8]) -> Certs {
 pub fn is_container_dir(dir: &Path) -> bool {
     CONTAINER_FILES.iter().all(|f| dir.join(f).exists())
 }
-pub fn read_container(dir: &Path) -> Result<(Option<String>, Certs)> {
+pub fn read_container(dir: &Path) -> Result<(Option<String>, ContainerCerts)> {
     if !dir.join("header.key").exists() {
         bail!(
             "{}: нет header.key — это не папка контейнера",

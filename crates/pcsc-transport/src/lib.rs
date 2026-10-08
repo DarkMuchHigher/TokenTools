@@ -1,6 +1,6 @@
-use anyhow::{anyhow, bail, Result};
-use std::ffi::{c_char, c_void, CString};
-use std::sync::Arc;
+use anyhow::{Result, anyhow, bail};
+use std::ffi::{CString, c_char, c_void};
+use std::rc::Rc;
 
 mod dynlib {
     use std::ffi::c_void;
@@ -11,7 +11,7 @@ mod dynlib {
 
         const RTLD_NOW: c_int = 2;
 
-        extern "C" {
+        unsafe extern "C" {
             fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
             fn dlclose(handle: *mut c_void) -> c_int;
@@ -20,33 +20,33 @@ mod dynlib {
 
         pub unsafe fn open(name: &str) -> Result<*mut c_void, String> {
             let name = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
-            let handle = dlopen(name.as_ptr(), RTLD_NOW);
+            let handle = unsafe { dlopen(name.as_ptr(), RTLD_NOW) };
             if handle.is_null() {
-                Err(last_error())
+                Err(unsafe { last_error() })
             } else {
                 Ok(handle)
             }
         }
 
         pub unsafe fn symbol(handle: *mut c_void, name: &[u8]) -> Result<*mut c_void, String> {
-            let symbol = dlsym(handle, name.as_ptr() as *const c_char);
+            let symbol = unsafe { dlsym(handle, name.as_ptr() as *const c_char) };
             if symbol.is_null() {
-                Err(last_error())
+                Err(unsafe { last_error() })
             } else {
                 Ok(symbol)
             }
         }
 
         pub unsafe fn close(handle: *mut c_void) {
-            dlclose(handle);
+            unsafe { dlclose(handle) };
         }
 
         unsafe fn last_error() -> String {
-            let error = dlerror();
+            let error = unsafe { dlerror() };
             if error.is_null() {
                 "неизвестная ошибка динамической загрузки".to_string()
             } else {
-                std::ffi::CStr::from_ptr(error)
+                unsafe { std::ffi::CStr::from_ptr(error) }
                     .to_string_lossy()
                     .into_owned()
             }
@@ -57,7 +57,7 @@ mod dynlib {
     mod imp {
         use std::ffi::c_void;
 
-        extern "system" {
+        unsafe extern "system" {
             fn LoadLibraryA(name: *const u8) -> *mut c_void;
             fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
             fn FreeLibrary(module: *mut c_void) -> i32;
@@ -66,7 +66,7 @@ mod dynlib {
         pub unsafe fn open(name: &str) -> Result<*mut c_void, String> {
             let mut name = name.as_bytes().to_vec();
             name.push(0);
-            let handle = LoadLibraryA(name.as_ptr());
+            let handle = unsafe { LoadLibraryA(name.as_ptr()) };
             if handle.is_null() {
                 Err(format!("LoadLibraryA: {}", name_display(&name)))
             } else {
@@ -75,7 +75,7 @@ mod dynlib {
         }
 
         pub unsafe fn symbol(handle: *mut c_void, name: &[u8]) -> Result<*mut c_void, String> {
-            let symbol = GetProcAddress(handle, name.as_ptr());
+            let symbol = unsafe { GetProcAddress(handle, name.as_ptr()) };
             if symbol.is_null() {
                 Err(format!("GetProcAddress: {}", name_display(name)))
             } else {
@@ -84,7 +84,7 @@ mod dynlib {
         }
 
         pub unsafe fn close(handle: *mut c_void) {
-            FreeLibrary(handle);
+            unsafe { FreeLibrary(handle) };
         }
 
         fn name_display(name: &[u8]) -> String {
@@ -93,11 +93,11 @@ mod dynlib {
         }
     }
 
-    pub struct Dl {
+    pub struct Library {
         handle: *mut c_void,
     }
 
-    impl Dl {
+    impl Library {
         pub fn open(name: &str) -> anyhow::Result<Self> {
             unsafe { imp::open(name) }
                 .map(|handle| Self { handle })
@@ -105,19 +105,17 @@ mod dynlib {
         }
 
         pub unsafe fn symbol<T: Copy>(&self, name: &[u8]) -> anyhow::Result<T> {
-            let symbol = imp::symbol(self.handle, name).map_err(|e| anyhow::anyhow!(e))?;
-            Ok(std::mem::transmute_copy(&symbol))
+            let symbol =
+                unsafe { imp::symbol(self.handle, name) }.map_err(|e| anyhow::anyhow!(e))?;
+            Ok(unsafe { std::mem::transmute_copy(&symbol) })
         }
     }
 
-    impl Drop for Dl {
+    impl Drop for Library {
         fn drop(&mut self) {
             unsafe { imp::close(self.handle) }
         }
     }
-
-    unsafe impl Send for Dl {}
-    unsafe impl Sync for Dl {}
 }
 type ScardContext = usize;
 type ScardHandle = usize;
@@ -161,7 +159,7 @@ fn scard_err(what: &str, rc: Long) -> anyhow::Error {
     anyhow!("{what}: SCard error 0x{:08x}", rc as u32)
 }
 pub struct Pcsc {
-    _lib: dynlib::Dl,
+    _lib: dynlib::Library,
     establish: FnEstablish,
     release: FnRelease,
     list_readers: FnListReaders,
@@ -170,7 +168,7 @@ pub struct Pcsc {
     transmit: FnTransmit,
 }
 impl Pcsc {
-    pub fn load() -> Result<Arc<Self>> {
+    pub fn load() -> Result<Rc<Self>> {
         let candidates: &[&str] = if cfg!(target_os = "windows") {
             &["winscard.dll"]
         } else {
@@ -178,7 +176,7 @@ impl Pcsc {
         };
         let mut lib = None;
         for name in candidates {
-            if let Ok(candidate) = dynlib::Dl::open(name) {
+            if let Ok(candidate) = dynlib::Library::open(name) {
                 lib = Some(candidate);
                 break;
             }
@@ -193,7 +191,7 @@ impl Pcsc {
             let connect = lib.symbol::<FnConnect>(b"SCardConnect\0")?;
             let disconnect = lib.symbol::<FnDisconnect>(b"SCardDisconnect\0")?;
             let transmit = lib.symbol::<FnTransmit>(b"SCardTransmit\0")?;
-            Ok(Arc::new(Self {
+            Ok(Rc::new(Self {
                 _lib: lib,
                 establish,
                 release,
@@ -252,7 +250,7 @@ impl Pcsc {
         unsafe { (self.release)(ctx) };
         result
     }
-    pub fn connect(self: &Arc<Self>, reader: &str) -> Result<Card> {
+    pub fn connect(self: &Rc<Self>, reader: &str) -> Result<Card> {
         let mut ctx: ScardContext = 0;
         let rc = unsafe {
             (self.establish)(
@@ -289,7 +287,7 @@ impl Pcsc {
             bail!(scard_err("SCardConnect", rc));
         }
         Ok(Card {
-            pcsc: Arc::clone(self),
+            pcsc: Rc::clone(self),
             ctx,
             handle,
             protocol: proto,
@@ -297,7 +295,7 @@ impl Pcsc {
     }
 }
 pub struct Card {
-    pcsc: Arc<Pcsc>,
+    pcsc: Rc<Pcsc>,
     ctx: ScardContext,
     handle: ScardHandle,
     protocol: Dword,

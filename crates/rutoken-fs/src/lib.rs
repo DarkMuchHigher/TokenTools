@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Result};
-use rt_pcsc::Card;
+use anyhow::{Result, anyhow, bail};
+use pcsc_transport::Card;
 pub const CONTAINER_FILES: [&str; 6] = [
     "name.key",
     "header.key",
@@ -296,7 +296,9 @@ mod tests {
     fn verify_apdu_builds_case3() {
         assert_eq!(
             verify_apdu(PIN_REF_USER, b"12345678"),
-            vec![0x00, 0x20, 0x00, 0x02, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8']
+            vec![
+                0x00, 0x20, 0x00, 0x02, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8'
+            ]
         );
     }
 

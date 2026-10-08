@@ -1,11 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const USAGE: &str = "\
 TokenTools: выгрузка контейнеров с Рутокена (Tokens) + снятие неэкспортируемости (CertFix)
 
-Использование: rt-export [ОПЦИИ] <КОМАНДА>
+Использование: tokentools [ОПЦИИ] <КОМАНДА>
 
 Команды:
   list                 Считыватели PC/SC
@@ -13,7 +12,7 @@ TokenTools: выгрузка контейнеров с Рутокена (Tokens)
   dump <DEST>          Выгрузка контейнеров с токена [--pin PIN]
   fix <DIR>            Снять флаг неэкспортируемости [--cert CERT]
   verify <DIR>         Проверка контейнера через CryptoPro CSP
-  cert <DIR>           Извлечение сертификатов [--install]
+  cert <DIR>           Извлечение сертификатов [--install] [--show] [--pem]
 
 Опции:
   -v, --verbose        Подробный вывод
@@ -24,10 +23,23 @@ TokenTools: выгрузка контейнеров с Рутокена (Tokens)
 enum Cmd {
     List,
     Doctor,
-    Dump { dest: PathBuf, pin: Option<String> },
-    Fix { dir: PathBuf, cert: Option<PathBuf> },
-    Verify { dir: PathBuf },
-    Cert { dir: PathBuf, install: bool },
+    Dump {
+        dest: PathBuf,
+        pin: Option<String>,
+    },
+    Fix {
+        dir: PathBuf,
+        cert: Option<PathBuf>,
+    },
+    Verify {
+        dir: PathBuf,
+    },
+    Cert {
+        dir: PathBuf,
+        install: bool,
+        show: bool,
+        pem: bool,
+    },
 }
 
 enum Parsed {
@@ -71,10 +83,10 @@ fn set_once<'a>(slot: &mut Option<&'a str>, value: &'a str, error: &str) -> Resu
     Ok(())
 }
 
-fn no_args(p: &mut Parser<'_>, name: &str) -> Result<(), String> {
-    while let Some(arg) = p.next() {
+fn reject_extra_args(parser: &mut Parser<'_>, name: &str) -> Result<(), String> {
+    while let Some(arg) = parser.next() {
         if arg == "-v" || arg == "--verbose" {
-            p.verbose = true;
+            parser.verbose = true;
             continue;
         }
         return Err(format!("{name}: лишний аргумент: {arg}"));
@@ -99,23 +111,23 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         .get(i)
         .map(String::as_str)
         .ok_or("команда не указана")?;
-    let mut p = Parser::new(&args[i + 1..], verbose);
+    let mut parser = Parser::new(&args[i + 1..], verbose);
     let cmd = match name {
         "list" => {
-            no_args(&mut p, "list")?;
+            reject_extra_args(&mut parser, "list")?;
             Cmd::List
         }
         "doctor" => {
-            no_args(&mut p, "doctor")?;
+            reject_extra_args(&mut parser, "doctor")?;
             Cmd::Doctor
         }
         "dump" => {
             let mut dest = None;
             let mut pin = None;
-            while let Some(arg) = p.next() {
+            while let Some(arg) = parser.next() {
                 match arg {
-                    "-v" | "--verbose" => p.verbose = true,
-                    "--pin" => pin = Some(p.value_for("--pin")?.to_string()),
+                    "-v" | "--verbose" => parser.verbose = true,
+                    "--pin" => pin = Some(parser.value_for("--pin")?.to_string()),
                     _ if arg.starts_with("--pin=") => pin = Some(arg["--pin=".len()..].to_string()),
                     _ if arg.starts_with('-') => {
                         return Err(format!("dump: неизвестная опция: {arg}"));
@@ -132,10 +144,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         "fix" => {
             let mut dir = None;
             let mut cert = None;
-            while let Some(arg) = p.next() {
+            while let Some(arg) = parser.next() {
                 match arg {
-                    "-v" | "--verbose" => p.verbose = true,
-                    "--cert" => cert = Some(PathBuf::from(p.value_for("--cert")?)),
+                    "-v" | "--verbose" => parser.verbose = true,
+                    "--cert" => cert = Some(PathBuf::from(parser.value_for("--cert")?)),
                     _ if arg.starts_with("--cert=") => {
                         cert = Some(PathBuf::from(&arg["--cert=".len()..]));
                     }
@@ -153,9 +165,9 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         }
         "verify" => {
             let mut dir = None;
-            while let Some(arg) = p.next() {
+            while let Some(arg) = parser.next() {
                 match arg {
-                    "-v" | "--verbose" => p.verbose = true,
+                    "-v" | "--verbose" => parser.verbose = true,
                     _ if arg.starts_with('-') => {
                         return Err(format!("verify: неизвестная опция: {arg}"));
                     }
@@ -170,10 +182,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         "cert" => {
             let mut dir = None;
             let mut install = false;
-            while let Some(arg) = p.next() {
+            let mut show = false;
+            let mut pem = false;
+            while let Some(arg) = parser.next() {
                 match arg {
-                    "-v" | "--verbose" => p.verbose = true,
+                    "-v" | "--verbose" => parser.verbose = true,
                     "--install" => install = true,
+                    "--show" => show = true,
+                    "--pem" => pem = true,
                     _ if arg.starts_with('-') => {
                         return Err(format!("cert: неизвестная опция: {arg}"));
                     }
@@ -184,21 +200,16 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             Cmd::Cert {
                 dir: PathBuf::from(dir),
                 install,
+                show,
+                pem,
             }
         }
         other => return Err(format!("неизвестная команда: {other}")),
     };
     Ok(Parsed::Run {
-        verbose: p.verbose,
+        verbose: parser.verbose,
         cmd,
     })
-}
-
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()
 }
 
 fn main() -> Result<()> {
@@ -216,7 +227,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Parsed::Version => {
-            println!("rt-export {}", env!("CARGO_PKG_VERSION"));
+            println!("tokentools {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Parsed::Run { verbose, cmd } => run(verbose, cmd),
@@ -230,11 +241,16 @@ fn run(verbose: bool, cmd: Cmd) -> Result<()> {
         Cmd::Dump { dest, pin } => cmd_dump(&dest, verbose, pin.as_deref()),
         Cmd::Fix { dir, cert } => cmd_fix(&dir, cert),
         Cmd::Verify { dir } => cmd_verify(&dir),
-        Cmd::Cert { dir, install } => cmd_cert(&dir, install),
+        Cmd::Cert {
+            dir,
+            install,
+            show,
+            pem,
+        } => cmd_cert(&dir, install, show, pem),
     }
 }
 fn cmd_doctor() -> Result<()> {
-    let checks = certfix_core::check_dependencies();
+    let checks = certfix::check_dependencies();
     println!("Проверка окружения TokenTools:");
     for check in &checks {
         println!(
@@ -247,7 +263,7 @@ fn cmd_doctor() -> Result<()> {
     }
     let missing = checks
         .iter()
-        .filter(|check| check.state == certfix_core::DependencyState::Missing)
+        .filter(|check| check.state == certfix::DependencyState::Missing)
         .count();
     if missing == 0 {
         println!("Итог: все проверенные компоненты обнаружены.");
@@ -258,7 +274,7 @@ fn cmd_doctor() -> Result<()> {
 }
 
 fn cmd_list() -> Result<()> {
-    let pcsc = rt_pcsc::Pcsc::load()?;
+    let pcsc = pcsc_transport::Pcsc::load()?;
     let readers = pcsc.list_readers()?;
     if readers.is_empty() {
         println!("Считыватели PC/SC не найдены (токен не подключён?)");
@@ -274,16 +290,16 @@ fn resolve_pin(cli_pin: Option<&str>) -> (String, &'static str) {
     if let Some(pin) = cli_pin.filter(|pin| !pin.is_empty()) {
         return (pin.to_string(), "--pin");
     }
-    if let Ok(pin) = std::env::var("TOKENTOOLS_PIN") {
-        if !pin.is_empty() {
-            return (pin, "TOKENTOOLS_PIN");
-        }
+    if let Ok(pin) = std::env::var("TOKENTOOLS_PIN")
+        && !pin.is_empty()
+    {
+        return (pin, "TOKENTOOLS_PIN");
     }
     ("12345678".to_string(), "стандартный PIN по умолчанию")
 }
 
 fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
-    let pcsc = rt_pcsc::Pcsc::load()?;
+    let pcsc = pcsc_transport::Pcsc::load()?;
     let readers = pcsc.list_readers()?;
     if readers.is_empty() {
         bail!("считыватели PC/SC не найдены — подключите токен");
@@ -299,7 +315,7 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                 continue;
             }
         };
-        let fs = rt_fs::RutokenFs::new(&card, verbose);
+        let fs = rutoken_fs::RutokenFs::new(&card, verbose);
         match fs.authenticate_user_pin(&pin) {
             Ok(outcome) if outcome.already_authenticated => {
                 println!("  PIN: сессия уже авторизована");
@@ -333,11 +349,11 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                     .join("-")
             };
             if files.len() == 6 {
-                let mut blobs = Vec::with_capacity(files.len());
+                let mut container_files = Vec::with_capacity(files.len());
                 let mut ok = true;
-                for (fname, entry) in rt_fs::CONTAINER_FILES.iter().zip(files.iter()) {
+                for (fname, entry) in rutoken_fs::CONTAINER_FILES.iter().zip(files.iter()) {
                     match fs.read_file(entry.fid, entry.size) {
-                        Ok(blob) => blobs.push(((*fname).to_string(), blob)),
+                        Ok(blob) => container_files.push(((*fname).to_string(), blob)),
                         Err(e) => {
                             println!("    ошибка чтения {fname}: {e}");
                             ok = false;
@@ -352,10 +368,10 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                 let partial = dest.join(format!(
                     ".{pathstr}.partial-{}-{}",
                     std::process::id(),
-                    now_nanos()
+                    certfix::now_nanos()
                 ));
                 std::fs::create_dir(&partial)?;
-                for (fname, blob) in &blobs {
+                for (fname, blob) in &container_files {
                     if let Err(error) = std::fs::write(partial.join(fname), blob) {
                         let _ = std::fs::remove_dir_all(&partial);
                         return Err(error.into());
@@ -410,7 +426,7 @@ fn cmd_fix(dir: &Path, cert: Option<PathBuf>) -> Result<()> {
         }
     };
     println!("Запуск p12utility под Wine: --cprepair --container_folder . --keyexport");
-    let out = certfix_core::fix_container(&dir, &cert)?;
+    let out = certfix::fix_container(&dir, &cert)?;
     for line in out.lines().filter(|l| {
         !l.starts_with("fixme")
             && !l.starts_with("err:")
@@ -423,7 +439,7 @@ fn cmd_fix(dir: &Path, cert: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 fn cmd_verify(dir: &Path) -> Result<()> {
-    let out = certfix_core::verify_container(dir)?;
+    let out = certfix::verify_container(dir)?;
     for line in out.lines().filter(|l| {
         l.contains("Check")
             || l.contains("Certificate")
@@ -441,7 +457,7 @@ fn cmd_verify(dir: &Path) -> Result<()> {
         bail!("проверки не пройдены")
     }
 }
-fn cmd_cert(dir: &Path, install: bool) -> Result<()> {
+fn cmd_cert(dir: &Path, install: bool, show: bool, pem: bool) -> Result<()> {
     let (name, certs) = cryptopro_container::read_container(dir)?;
     if certs.owner.is_empty() {
         bail!("в header.key не найден сертификат владельца ([5])");
@@ -460,9 +476,25 @@ fn cmd_cert(dir: &Path, install: bool) -> Result<()> {
         println!("УЦ из цепочки: {} ({} байт)", f.display(), c.len());
         chain_files.push(f);
     }
+    if show {
+        print_cert_info("Владелец", &owner);
+        for (i, f) in chain_files.iter().enumerate() {
+            print_cert_info(&format!("УЦ #{i}"), f);
+        }
+    }
+    if pem {
+        let owner_pem = owner.with_extension("pem");
+        std::fs::write(&owner_pem, cryptopro_container::to_pem(&certs.owner))?;
+        println!("PEM: {}", owner_pem.display());
+        for (i, c) in certs.chain.iter().enumerate() {
+            let f = dir.join(format!("ca_chain_{i}.pem"));
+            std::fs::write(&f, cryptopro_container::to_pem(c))?;
+            println!("PEM УЦ #{i}: {}", f.display());
+        }
+    }
     if install {
         let cname = name.unwrap_or_else(|| "unknown".into());
-        let (out, ok) = certfix_core::certmgr_install(&owner, Some(&cname), "uMy")?;
+        let (out, ok) = certfix::certmgr_install(&owner, Some(&cname), "uMy")?;
         println!(
             "Установка сертификата владельца в uMy: {}",
             if ok { "OK" } else { "ошибка" }
@@ -472,11 +504,43 @@ fn cmd_cert(dir: &Path, install: bool) -> Result<()> {
         }
         for (i, f) in chain_files.iter().enumerate() {
             let store = if i == 0 { "uRoot" } else { "uCA" };
-            let (_, ok) = certfix_core::certmgr_install(f, None, store)?;
+            let (_, ok) = certfix::certmgr_install(f, None, store)?;
             println!("УЦ #{i} -> {store}: {}", if ok { "OK" } else { "ошибка" });
         }
     }
     Ok(())
+}
+
+fn print_cert_info(label: &str, path: &Path) {
+    let der = match std::fs::read(path) {
+        Ok(der) => der,
+        Err(error) => {
+            println!("{label}: {error}");
+            return;
+        }
+    };
+    match cryptopro_container::parse_cert(&der) {
+        Ok(info) => {
+            println!("{label}: {}", path.display());
+            if let Some(cn) = &info.subject_cn {
+                println!("  Субъект: {cn}");
+            }
+            if let Some(cn) = &info.issuer_cn {
+                println!("  Издатель: {cn}");
+            }
+            println!("  Серийный номер: {}", info.serial_hex);
+            if let (Some(from), Some(to)) = (&info.not_before, &info.not_after) {
+                println!("  Действует: с {from} по {to}");
+            }
+            println!("  SHA-1:   {}", hex_lower(&info.sha1));
+            println!("  SHA-256: {}", hex_lower(&info.sha256));
+        }
+        Err(error) => println!("{label}: {}: {error}", path.display()),
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -533,7 +597,9 @@ mod tests {
             cmd,
             Cmd::Cert {
                 dir: PathBuf::from("./c"),
-                install: true
+                install: true,
+                show: false,
+                pem: false
             }
         );
         let Ok(Parsed::Run { cmd, .. }) = parse(&["fix", "./c", "--cert", "./cert.cer"]) else {
@@ -544,6 +610,22 @@ mod tests {
             Cmd::Fix {
                 dir: PathBuf::from("./c"),
                 cert: Some(PathBuf::from("./cert.cer"))
+            }
+        );
+    }
+
+    #[test]
+    fn parses_cert_show_and_pem() {
+        let Ok(Parsed::Run { cmd, .. }) = parse(&["cert", "./c", "--show", "--pem"]) else {
+            panic!("должно разобраться");
+        };
+        assert_eq!(
+            cmd,
+            Cmd::Cert {
+                dir: PathBuf::from("./c"),
+                install: false,
+                show: true,
+                pem: true
             }
         );
     }

@@ -1,5 +1,5 @@
 [package]
-name = "rt-export"
+name = "tokentools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ description = "CLI TokenTools: выгрузка контейнеров с Рут
 
 [dependencies]
 anyhow.workspace = true
-rt-pcsc = { path = "../../crates/rt-pcsc" }
-rt-fs = { path = "../../crates/rt-fs" }
-cryptopro-container = { path = "../../crates/cryptopro-container" }
-certfix-core = { path = "../../crates/certfix-core" }
+pcsc-transport = { path = "../pcsc-transport" }
+rutoken-fs = { path = "../rutoken-fs" }
+cryptopro-container = { path = "../cryptopro-container" }
+certfix = { path = "../certfix" }

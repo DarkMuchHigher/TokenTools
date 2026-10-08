@@ -536,12 +536,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "certfix-core"
-version = "0.1.0"
+name = "certfix"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cryptopro-container",
- "rt-pcsc",
+ "pcsc-transport",
 ]
 
 [[package]]
@@ -674,7 +674,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cryptopro-container"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
 ]
@@ -2018,6 +2018,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcsc-transport"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2296,32 +2303,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "rt-export"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "certfix-core",
- "cryptopro-container",
- "rt-fs",
- "rt-pcsc",
-]
-
-[[package]]
-name = "rt-fs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rt-pcsc",
-]
-
-[[package]]
-name = "rt-pcsc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2373,6 +2354,14 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "rutoken-fs"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "pcsc-transport",
+]
 
 [[package]]
 name = "same-file"
@@ -2691,14 +2680,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokentools-gui"
-version = "0.1.0"
+name = "tokentools"
+version = "0.2.0"
 dependencies = [
- "certfix-core",
+ "anyhow",
+ "certfix",
+ "cryptopro-container",
+ "pcsc-transport",
+ "rutoken-fs",
+]
+
+[[package]]
+name = "tokentools-gui"
+version = "0.2.0"
+dependencies = [
+ "certfix",
  "cryptopro-container",
  "eframe",
- "rt-fs",
- "rt-pcsc",
+ "pcsc-transport",
+ "rutoken-fs",
 ]
 
 [[package]]

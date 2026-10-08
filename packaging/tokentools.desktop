@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TokenTools
+Comment=Контейнеры КриптоПро на Рутокенах
+Exec=tokentools-gui
+Icon=tokentools
+Terminal=false
+Categories=Utility;Security;
+StartupWMClass=tokentools

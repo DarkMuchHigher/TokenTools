@@ -1,12 +1,15 @@
 [workspace]
-resolver = "2"
-members = ["crates/*", "bins/*"]
+resolver = "3"
+members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+
+[profile.release]
+strip = true

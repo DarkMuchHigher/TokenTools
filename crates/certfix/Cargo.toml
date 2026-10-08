@@ -1,5 +1,5 @@
 [package]
-name = "certfix-core"
+name = "certfix"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,4 +9,4 @@ description = "CertFix: снятие неэкспортируемости (p12ut
 [dependencies]
 anyhow.workspace = true
 cryptopro-container = { path = "../cryptopro-container" }
-rt-pcsc = { path = "../rt-pcsc" }
+pcsc-transport = { path = "../pcsc-transport" }

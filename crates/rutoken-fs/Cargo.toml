@@ -1,5 +1,5 @@
 [package]
-name = "rt-fs"
+name = "rutoken-fs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,4 +8,4 @@ description = "Обход файловой системы Рутокена по 
 
 [dependencies]
 anyhow.workspace = true
-rt-pcsc = { path = "../rt-pcsc" }
+pcsc-transport = { path = "../pcsc-transport" }

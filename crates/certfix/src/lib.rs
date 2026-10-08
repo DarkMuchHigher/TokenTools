@@ -1,5 +1,5 @@
-use anyhow::{bail, Context, Result};
-use cryptopro_container::{build_name_key, cp1251_to_string, is_container_dir, CONTAINER_FILES};
+use anyhow::{Context, Result, bail};
+use cryptopro_container::{CONTAINER_FILES, build_name_key, cp1251_to_string, is_container_dir};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,7 +20,7 @@ fn user_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn now_nanos() -> u128 {
+pub fn now_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -48,7 +48,7 @@ fn find_p12utility() -> Result<PathBuf> {
     candidates
         .into_iter()
         .find(|p| p.is_file())
-        .context("p12utility.win32.exe не найден (положите рядом с rt-export или задайте TOKENTOOLS_P12UTILITY)")
+        .context("p12utility.win32.exe не найден (положите рядом с tokentools или задайте TOKENTOOLS_P12UTILITY)")
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -124,7 +124,7 @@ fn flatpak_wine_available() -> bool {
 }
 
 fn check_pcsc() -> DependencyStatus {
-    match rt_pcsc::Pcsc::load() {
+    match pcsc_transport::Pcsc::load() {
         Ok(pcsc) => match pcsc.list_readers() {
             Ok(readers) if readers.is_empty() => DependencyStatus {
                 name: "PC/SC",
@@ -292,10 +292,10 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
         cmd = Command::new("flatpak");
         cmd.args(["run"]);
         cmd.arg(format!("--filesystem={}", container_dir.display()));
-        if cert.parent() != container_dir.parent() {
-            if let Some(parent) = cert.parent() {
-                cmd.arg(format!("--filesystem={}", parent.display()));
-            }
+        if cert.parent() != container_dir.parent()
+            && let Some(parent) = cert.parent()
+        {
+            cmd.arg(format!("--filesystem={}", parent.display()));
         }
         cmd.args(["org.winehq.Wine"]).arg(&exe);
     } else {
@@ -452,10 +452,112 @@ pub fn certmgr_install(
         cmd.args(["-container", c]);
     }
     cmd.args(["-store", store]);
-    let out = cmd.output().context("не удалось запустить certmgr")?;
-    let mut text = decode_csp_output(&out.stdout);
-    text.push_str(&decode_csp_output(&out.stderr));
-    Ok((text, out.status.success()))
+    let output = cmd.output().context("не удалось запустить certmgr")?;
+    let mut text = decode_csp_output(&output.stdout);
+    text.push_str(&decode_csp_output(&output.stderr));
+    Ok((text, output.status.success()))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoreCert {
+    pub subject: String,
+    pub issuer: String,
+    pub serial: String,
+    pub sha1: String,
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+    pub has_key: bool,
+    pub container: Option<String>,
+}
+
+pub fn certmgr_list(store: &str) -> Result<Vec<StoreCert>> {
+    let output = Command::new(find_csp_tool("certmgr")?)
+        .args(["-list", "-store", store])
+        .output()
+        .context("не удалось запустить certmgr")?;
+    let text = decode_csp_output(&output.stdout);
+    if !output.status.success() && !text.contains("-------") {
+        bail!("certmgr завершился с ошибкой");
+    }
+    Ok(parse_certmgr_list(&text))
+}
+
+fn parse_certmgr_list(text: &str) -> Vec<StoreCert> {
+    let mut certs = Vec::new();
+    let mut current: Option<StoreCert> = None;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if is_cert_block_header(line) {
+            certs.extend(current.take());
+            current = Some(StoreCert::default());
+            continue;
+        }
+        let Some(cert) = current.as_mut() else {
+            continue;
+        };
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match label.trim() {
+            "Субъект" => cert.subject = value.to_string(),
+            "Издатель" => cert.issuer = value.to_string(),
+            "Серийный номер" => cert.serial = value.to_string(),
+            "SHA1 отпечаток" => cert.sha1 = value.to_string(),
+            "Выдан" => cert.not_before = Some(normalize_certmgr_date(value)),
+            "Истекает" => cert.not_after = Some(normalize_certmgr_date(value)),
+            "Ссылка на ключ" => cert.has_key = value == "Есть",
+            "Контейнер" => cert.container = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    certs.extend(current);
+    certs
+}
+
+fn is_cert_block_header(line: &str) -> bool {
+    let line = line.trim();
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    digits > 0 && line[digits..].chars().all(|c| c == '-')
+}
+
+fn normalize_certmgr_date(value: &str) -> String {
+    let tokens: Vec<&str> = value.split(['/', ' ']).filter(|t| !t.is_empty()).collect();
+    if tokens.len() >= 3 && tokens[0].len() == 2 && tokens[1].len() == 2 && tokens[2].len() == 4 {
+        let rest = tokens[3..].join(" ");
+        if rest.is_empty() {
+            format!("{}-{}-{}", tokens[2], tokens[1], tokens[0])
+        } else {
+            format!("{}-{}-{} {rest}", tokens[2], tokens[1], tokens[0])
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+pub fn cn_from_dn(dn: &str) -> Option<String> {
+    let start = dn.find("CN=")? + "CN=".len();
+    let rest = &dn[start..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = quoted.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    out.push('"');
+                    chars.next();
+                } else {
+                    break;
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
+    } else {
+        let end = rest.find(',').unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
 }
 
 #[cfg(test)]
@@ -482,5 +584,65 @@ mod tests {
         assert_eq!(DependencyState::Ready.label(), "OK");
         assert_eq!(DependencyState::Notice.label(), "INFO");
         assert_eq!(DependencyState::Missing.label(), "MISSING");
+    }
+
+    #[test]
+    fn parses_certmgr_list_blocks() {
+        let sample = r#"Certmgr Ver:5.0.13003 OS:Linux CPU:AMD64 (c) "КРИПТО-ПРО", 2007-2024.
+=============================================================================
+1-------
+Издатель            : ИНН ЮЛ=7707329152, CN=Федеральная налоговая служба
+Субъект             : ИНН ЮЛ=7801571136, CN="ООО ""АНДРЕЕВСКИЙ ДОМ""", T=ГЕНЕРАЛЬНЫЙ ДИРЕКТОР
+Серийный номер      : 0x03B0979C0073B4A1A0499CC8CDF876E675
+SHA1 отпечаток      : e2eaea9134f40622ce79675ba9d49aaf9f53cebe
+Выдан               : 24/06/2026 09:20:08 UTC
+Истекает            : 24/09/2027 09:30:08 UTC
+Ссылка на ключ      : Есть
+Контейнер           : GENERIC\FLASH_AAAC0DD1\2560\D08E
+Назначение/EKU      : 1.3.6.1.5.5.7.3.2 Проверка подлинности клиента
+                      1.3.6.1.5.5.7.3.4 Защищенная электронная почта
+2-------
+Издатель            : CN=Корень
+Субъект             : CN=Корень
+Серийный номер      : 0x01
+SHA1 отпечаток      : aabb
+Истекает            : 01/01/2040 00:00:00 UTC
+Ссылка на ключ      : Нет
+"#;
+        let certs = parse_certmgr_list(sample);
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].serial, "0x03B0979C0073B4A1A0499CC8CDF876E675");
+        assert_eq!(
+            certs[0].not_before.as_deref(),
+            Some("2026-06-24 09:20:08 UTC")
+        );
+        assert_eq!(
+            certs[0].not_after.as_deref(),
+            Some("2027-09-24 09:30:08 UTC")
+        );
+        assert!(certs[0].has_key);
+        assert_eq!(
+            certs[0].container.as_deref(),
+            Some("GENERIC\\FLASH_AAAC0DD1\\2560\\D08E")
+        );
+        assert_eq!(
+            cn_from_dn(&certs[0].subject).as_deref(),
+            Some("ООО \"АНДРЕЕВСКИЙ ДОМ\"")
+        );
+        assert!(!certs[1].has_key);
+        assert_eq!(cn_from_dn(&certs[1].subject).as_deref(), Some("Корень"));
+    }
+
+    #[test]
+    fn cn_from_dn_handles_plain_and_quoted() {
+        assert_eq!(
+            cn_from_dn("C=RU, CN=Простой, O=X").as_deref(),
+            Some("Простой")
+        );
+        assert_eq!(
+            cn_from_dn("CN=\"A \"\"B\"\" C\"").as_deref(),
+            Some("A \"B\" C")
+        );
+        assert_eq!(cn_from_dn("O=Без CN"), None);
     }
 }
