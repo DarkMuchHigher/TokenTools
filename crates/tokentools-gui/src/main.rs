@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -241,6 +243,14 @@ struct App {
     certs: Vec<certfix::StoreCert>,
     certs_loaded: bool,
     certs_loading: bool,
+}
+
+fn log_dir() -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("tokentools"))
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("tokentools"))
+    }
 }
 
 fn default_pin() -> String {
@@ -707,8 +717,7 @@ impl App {
 
     fn log(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            let dir = PathBuf::from(home).join(".cache").join("tokentools");
+        if let Some(dir) = log_dir() {
             let _ = std::fs::create_dir_all(&dir);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -1441,8 +1450,11 @@ impl App {
                     }
                 });
             });
+            let log_path = log_dir()
+                .map(|dir| dir.join("session.log").display().to_string())
+                .unwrap_or_else(|| "session.log".to_string());
             ui.label(
-                egui::RichText::new("полный журнал: ~/.cache/tokentools/session.log")
+                egui::RichText::new(format!("полный журнал: {log_path}"))
                     .size(12.0)
                     .color(palette.muted),
             );
@@ -1549,8 +1561,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let text = format!("{info}");
         eprintln!("panic: {text}");
-        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            let dir = PathBuf::from(home).join(".cache").join("tokentools");
+        if let Some(dir) = log_dir() {
             let _ = std::fs::create_dir_all(&dir);
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
