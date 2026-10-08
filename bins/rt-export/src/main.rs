@@ -20,6 +20,8 @@ enum Cmd {
     Doctor,
     Dump {
         dest: PathBuf,
+        #[arg(long)]
+        pin: Option<String>,
     },
     Fix {
         dir: PathBuf,
@@ -47,7 +49,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::List => cmd_list(),
         Cmd::Doctor => cmd_doctor(),
-        Cmd::Dump { dest } => cmd_dump(&dest, cli.verbose),
+        Cmd::Dump { dest, pin } => cmd_dump(&dest, cli.verbose, pin.as_deref()),
         Cmd::Fix { dir, cert } => cmd_fix(&dir, cert),
         Cmd::Verify { dir } => cmd_verify(&dir),
         Cmd::Cert { dir, install } => cmd_cert(&dir, install),
@@ -90,13 +92,26 @@ fn cmd_list() -> Result<()> {
     }
     Ok(())
 }
-fn cmd_dump(dest: &Path, verbose: bool) -> Result<()> {
+fn resolve_pin(cli_pin: Option<&str>) -> (String, &'static str) {
+    if let Some(pin) = cli_pin.filter(|pin| !pin.is_empty()) {
+        return (pin.to_string(), "--pin");
+    }
+    if let Ok(pin) = std::env::var("TOKENTOOLS_PIN") {
+        if !pin.is_empty() {
+            return (pin, "TOKENTOOLS_PIN");
+        }
+    }
+    ("12345678".to_string(), "стандартный PIN по умолчанию")
+}
+
+fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
     let pcsc = rt_pcsc::Pcsc::load()?;
     let readers = pcsc.list_readers()?;
     if readers.is_empty() {
         bail!("считыватели PC/SC не найдены — подключите токен");
     }
     std::fs::create_dir_all(dest)?;
+    let (pin, pin_source) = resolve_pin(pin);
     for reader in &readers {
         println!("Считыватель: {reader}");
         let card = match pcsc.connect(reader) {
@@ -107,6 +122,16 @@ fn cmd_dump(dest: &Path, verbose: bool) -> Result<()> {
             }
         };
         let fs = rt_fs::RutokenFs::new(&card, verbose);
+        match fs.authenticate_user_pin(&pin) {
+            Ok(outcome) if outcome.already_authenticated => {
+                println!("  PIN: сессия уже авторизована");
+            }
+            Ok(_) => println!("  PIN принят ({pin_source})"),
+            Err(e) => {
+                println!("  PIN: {e}");
+                continue;
+            }
+        }
         println!("  выбираю MF (3F00)...");
         let (_, sw) = fs.select_mf()?;
         if sw != 0x9000 {

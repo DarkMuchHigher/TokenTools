@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use rt_pcsc::Card;
 pub const CONTAINER_FILES: [&str; 6] = [
     "name.key",
@@ -8,6 +8,32 @@ pub const CONTAINER_FILES: [&str; 6] = [
     "primary2.key",
     "masks2.key",
 ];
+pub const PIN_REF_USER: u8 = 0x02;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinState {
+    Authenticated,
+    TriesLeft(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthOutcome {
+    pub already_authenticated: bool,
+}
+
+fn verify_apdu(pin_ref: u8, pin: &[u8]) -> Vec<u8> {
+    let mut apdu = vec![0x00, 0x20, 0x00, pin_ref, pin.len() as u8];
+    apdu.extend_from_slice(pin);
+    apdu
+}
+
+fn pin_state_from_sw(sw: u16) -> Option<PinState> {
+    match sw {
+        0x9000 => Some(PinState::Authenticated),
+        0x63C0..=0x63CF => Some(PinState::TriesLeft((sw & 0x0F) as u8)),
+        _ => None,
+    }
+}
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub fid: u16,
@@ -105,6 +131,40 @@ impl<'a> RutokenFs<'a> {
             bail!("не удалось выбрать файл {fid:04x}: SW={sw:04x}");
         }
         self.read_binary(0, length)
+    }
+    pub fn pin_state(&self, pin_ref: u8) -> Result<PinState> {
+        let (_, sw) = self.card.transmit(&[0x00, 0x20, 0x00, pin_ref])?;
+        pin_state_from_sw(sw).ok_or_else(|| anyhow!("VERIFY: неожиданный SW={sw:04x}"))
+    }
+    pub fn verify_pin(&self, pin_ref: u8, pin: &[u8]) -> Result<u16> {
+        if pin.is_empty() || pin.len() > 255 {
+            bail!("некорректная длина PIN ({} байт)", pin.len());
+        }
+        let (_, sw) = self.card.transmit(&verify_apdu(pin_ref, pin))?;
+        Ok(sw)
+    }
+    pub fn authenticate_user_pin(&self, pin: &str) -> Result<AuthOutcome> {
+        match self.pin_state(PIN_REF_USER)? {
+            PinState::Authenticated => Ok(AuthOutcome {
+                already_authenticated: true,
+            }),
+            PinState::TriesLeft(0) => bail!(
+                "PIN пользователя заблокирован: попыток не осталось \
+                 (разблокировка — через Панель управления Рутокен или админ-PIN)"
+            ),
+            PinState::TriesLeft(tries) => match self.verify_pin(PIN_REF_USER, pin.as_bytes())? {
+                0x9000 => Ok(AuthOutcome {
+                    already_authenticated: false,
+                }),
+                0x6983 => bail!("PIN пользователя заблокирован (SW=6983)"),
+                sw if (0x63C0..=0x63CF).contains(&sw) => {
+                    bail!("неверный PIN: осталось попыток {}", sw & 0x0F)
+                }
+                sw => bail!(
+                    "VERIFY: неожиданный SW={sw:04x} (перед вводом оставалось попыток: {tries})"
+                ),
+            },
+        }
     }
     fn parse_fcp(resp: &[u8]) -> Option<FileEntry> {
         if resp.len() < 2 || resp[0] != 0x62 {
@@ -230,5 +290,21 @@ mod tests {
             parse_tlv(&[0x01, 0x02, 0xaa, 0xbb, 0x02, 0x82, 0x00, 0x01, 0xcc]),
             vec![(0x01, vec![0xaa, 0xbb]), (0x02, vec![0xcc])]
         );
+    }
+
+    #[test]
+    fn verify_apdu_builds_case3() {
+        assert_eq!(
+            verify_apdu(PIN_REF_USER, b"12345678"),
+            vec![0x00, 0x20, 0x00, 0x02, 0x08, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8']
+        );
+    }
+
+    #[test]
+    fn pin_state_parses_sw() {
+        assert_eq!(pin_state_from_sw(0x9000), Some(PinState::Authenticated));
+        assert_eq!(pin_state_from_sw(0x63C3), Some(PinState::TriesLeft(3)));
+        assert_eq!(pin_state_from_sw(0x63C0), Some(PinState::TriesLeft(0)));
+        assert_eq!(pin_state_from_sw(0x6A82), None);
     }
 }

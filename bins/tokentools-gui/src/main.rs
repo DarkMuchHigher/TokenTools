@@ -110,6 +110,7 @@ enum Msg {
     Status(String),
     Readers(Vec<String>),
     Found(Vec<Found>),
+    PinFailed,
     Done,
 }
 
@@ -230,6 +231,15 @@ struct App {
     container_info: Option<String>,
     info_for: String,
     next_poll: f64,
+    pin: String,
+    pin_failed: bool,
+}
+
+fn default_pin() -> String {
+    std::env::var("TOKENTOOLS_PIN")
+        .ok()
+        .filter(|pin| !pin.is_empty())
+        .unwrap_or_else(|| "12345678".to_string())
 }
 
 fn now_nanos() -> u128 {
@@ -264,7 +274,7 @@ fn container_summary(dir: &str) -> Option<String> {
     }
 }
 
-fn detect_task(tx: &Sender<Msg>, announce: bool) {
+fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String) {
     let _ = tx.send(Msg::Readers(Vec::new()));
     let _ = tx.send(Msg::Found(Vec::new()));
     let _ = tx.send(Msg::Status("Поиск устройств…".into()));
@@ -301,6 +311,21 @@ fn detect_task(tx: &Sender<Msg>, announce: bool) {
             }
         };
         let fs = rt_fs::RutokenFs::new(&card, false);
+        match fs.authenticate_user_pin(&pin) {
+            Ok(outcome) => {
+                let text = if outcome.already_authenticated {
+                    "  PIN: сессия уже авторизована"
+                } else {
+                    "  PIN принят"
+                };
+                let _ = tx.send(Msg::Log(Level::Ok, text.into()));
+            }
+            Err(e) => {
+                let _ = tx.send(Msg::Log(Level::Err, format!("  PIN: {e}")));
+                let _ = tx.send(Msg::PinFailed);
+                continue;
+            }
+        }
         match fs.select_mf() {
             Ok((_, 0x9000)) => {
                 let _ = tx.send(Msg::Log(Level::Info, "  MF выбран (3F00)".into()));
@@ -473,6 +498,8 @@ impl App {
             container_info: None,
             info_for: String::new(),
             next_poll: 0.0,
+            pin: default_pin(),
+            pin_failed: false,
         };
         app.log(Level::Info, "TokenTools запущен".to_string());
         for check in certfix_core::check_dependencies() {
@@ -548,6 +575,7 @@ impl App {
                 Msg::Status(s) => self.status = s,
                 Msg::Readers(r) => self.readers = r,
                 Msg::Found(f) => self.found = f,
+                Msg::PinFailed => self.pin_failed = true,
                 Msg::Done => {
                     self.busy = false;
                     self.status = "Готово".to_string();
@@ -560,7 +588,8 @@ impl App {
         self.readers.clear();
         self.found.clear();
         self.status = "Поиск устройств…".to_string();
-        self.spawn(move |tx| detect_task(tx, announce));
+        let pin = self.pin.clone();
+        self.spawn(move |tx| detect_task(tx, announce, pin));
     }
 
     fn dump(&mut self, items: Vec<Found>) {
@@ -837,7 +866,7 @@ impl eframe::App for App {
         }
         let pal = self.pal();
         let now = ui.ctx().input(|i| i.time);
-        if !self.busy && now > self.next_poll {
+        if !self.busy && !self.pin_failed && self.readers.is_empty() && now > self.next_poll {
             self.next_poll = now + 2.5;
             self.detect(false);
         }
@@ -909,10 +938,25 @@ impl eframe::App for App {
                             section_title(ui, &pal, "Устройство");
                             ui.horizontal(|ui| {
                                 if ui.button("Обновить").clicked() {
+                                    self.pin_failed = false;
                                     self.detect(true);
                                 }
                                 ui.label(
                                     egui::RichText::new("поиск выполняется автоматически")
+                                        .size(12.5)
+                                        .color(pal.muted),
+                                );
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("PIN пользователя").color(pal.muted));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.pin)
+                                        .password(true)
+                                        .desired_width(140.0),
+                                );
+                                ui.label(
+                                    egui::RichText::new("по умолчанию 12345678")
                                         .size(12.5)
                                         .color(pal.muted),
                                 );
