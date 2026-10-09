@@ -286,16 +286,14 @@ fn cmd_list() -> Result<()> {
     }
     Ok(())
 }
-fn resolve_pin(cli_pin: Option<&str>) -> (String, &'static str) {
+fn resolve_pin(cli_pin: Option<&str>, env_pin: Option<String>) -> Result<(String, &'static str)> {
     if let Some(pin) = cli_pin.filter(|pin| !pin.is_empty()) {
-        return (pin.to_string(), "--pin");
+        return Ok((pin.to_string(), "--pin"));
     }
-    if let Ok(pin) = std::env::var("TOKENTOOLS_PIN")
-        && !pin.is_empty()
-    {
-        return (pin, "TOKENTOOLS_PIN");
+    if let Some(pin) = env_pin.filter(|pin| !pin.is_empty()) {
+        return Ok((pin, "TOKENTOOLS_PIN"));
     }
-    ("12345678".to_string(), "стандартный PIN по умолчанию")
+    bail!("PIN не задан: передайте --pin или установите TOKENTOOLS_PIN")
 }
 
 fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
@@ -304,8 +302,8 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
     if readers.is_empty() {
         bail!("считыватели PC/SC не найдены — подключите токен");
     }
+    let (pin, pin_source) = resolve_pin(pin, std::env::var("TOKENTOOLS_PIN").ok())?;
     std::fs::create_dir_all(dest)?;
-    let (pin, pin_source) = resolve_pin(pin);
     for reader in &readers {
         println!("Считыватель: {reader}");
         let card = match pcsc.connect(reader) {
@@ -375,9 +373,9 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                     std::process::id(),
                     certfix::now_nanos()
                 ));
-                std::fs::create_dir(&partial)?;
+                certfix::create_private_dir(&partial)?;
                 for (fname, blob) in &container_files {
-                    if let Err(error) = std::fs::write(partial.join(fname), blob) {
+                    if let Err(error) = certfix::write_private(&partial.join(fname), blob) {
                         let _ = std::fs::remove_dir_all(&partial);
                         return Err(error.into());
                     }
@@ -425,7 +423,7 @@ fn cmd_fix(dir: &Path, cert: Option<PathBuf>) -> Result<()> {
                 bail!("в header.key не найден сертификат владельца ([5]); укажите --cert");
             }
             let path = dir.join("cert_exchange.cer");
-            std::fs::write(&path, &certs.owner)?;
+            certfix::write_private_once(&path, &certs.owner)?;
             println!("Сертификат владельца извлечён: {}", path.display());
             path
         }
@@ -468,7 +466,7 @@ fn cmd_cert(dir: &Path, install: bool, show: bool, pem: bool) -> Result<()> {
         bail!("в header.key не найден сертификат владельца ([5])");
     }
     let owner = dir.join("cert_exchange.cer");
-    std::fs::write(&owner, &certs.owner)?;
+    certfix::write_private_once(&owner, &certs.owner)?;
     println!(
         "Сертификат владельца: {} ({} байт)",
         owner.display(),
@@ -477,7 +475,7 @@ fn cmd_cert(dir: &Path, install: bool, show: bool, pem: bool) -> Result<()> {
     let mut chain_files = Vec::new();
     for (i, c) in certs.chain.iter().enumerate() {
         let f = dir.join(format!("ca_chain_{i}.cer"));
-        std::fs::write(&f, c)?;
+        certfix::write_private_once(&f, c)?;
         println!("УЦ из цепочки: {} ({} байт)", f.display(), c.len());
         chain_files.push(f);
     }
@@ -489,11 +487,14 @@ fn cmd_cert(dir: &Path, install: bool, show: bool, pem: bool) -> Result<()> {
     }
     if pem {
         let owner_pem = owner.with_extension("pem");
-        std::fs::write(&owner_pem, cryptopro_container::to_pem(&certs.owner))?;
+        certfix::write_private_once(
+            &owner_pem,
+            cryptopro_container::to_pem(&certs.owner).as_bytes(),
+        )?;
         println!("PEM: {}", owner_pem.display());
         for (i, c) in certs.chain.iter().enumerate() {
             let f = dir.join(format!("ca_chain_{i}.pem"));
-            std::fs::write(&f, cryptopro_container::to_pem(c))?;
+            certfix::write_private_once(&f, cryptopro_container::to_pem(c).as_bytes())?;
             println!("PEM УЦ #{i}: {}", f.display());
         }
     }
@@ -632,6 +633,19 @@ mod tests {
                 show: true,
                 pem: true
             }
+        );
+    }
+
+    #[test]
+    fn pin_must_be_explicit_or_configured() {
+        assert!(resolve_pin(None, None).is_err());
+        assert_eq!(
+            resolve_pin(None, Some("87654321".to_string())).unwrap(),
+            ("87654321".to_string(), "TOKENTOOLS_PIN")
+        );
+        assert_eq!(
+            resolve_pin(Some("1234"), Some("87654321".to_string())).unwrap(),
+            ("1234".to_string(), "--pin")
         );
     }
 

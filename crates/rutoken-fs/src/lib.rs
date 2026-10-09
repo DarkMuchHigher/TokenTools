@@ -36,15 +36,19 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn trace_apdu_text(apdu: &[u8]) -> String {
-    let secret = matches!(apdu.get(1), Some(0x20 | 0x24));
-    if secret && apdu.len() > 5 {
-        let masked = std::iter::repeat_n("**", apdu.len() - 5)
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("{} {masked}", hex(&apdu[..5]))
-    } else {
-        hex(apdu)
+    if apdu.len() < 5 {
+        return hex(apdu);
     }
+    let lc = apdu[4] as usize;
+    let mut text = format!("{} Lc={lc:02X} data=<redacted:{lc}B>", hex(&apdu[..4]));
+    if apdu.len() > 5 + lc {
+        text.push_str(&format!(" Le={:02X}", apdu[5 + lc]));
+    }
+    text
+}
+
+fn trace_response(data_len: usize, sw: u16) -> String {
+    format!("<- data={data_len}B SW={sw:04x}")
 }
 
 fn pin_state_from_sw(sw: u16) -> Option<PinState> {
@@ -99,17 +103,7 @@ impl<'a> RutokenFs<'a> {
     fn transmit(&self, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
         self.log(&format!("-> {}", trace_apdu_text(apdu)));
         let (data, sw) = self.card.transmit(apdu)?;
-        let shown = if data.len() > 24 {
-            format!("{}…", hex(&data[..24]))
-        } else {
-            hex(&data)
-        };
-        let size = if data.is_empty() {
-            String::new()
-        } else {
-            format!(" · {} байт", data.len())
-        };
-        self.log(&format!("<- {shown} SW={sw:04x}{size}"));
+        self.log(&trace_response(data.len(), sw));
         Ok((data, sw))
     }
     fn select_raw(&self, p1: u8, p2: u8, data: &[u8], le: u8) -> Result<(Vec<u8>, u16)> {
@@ -338,16 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn trace_masks_pin_bytes() {
-        let apdu = verify_apdu(PIN_REF_USER, b"12345678");
+    fn trace_redacts_all_apdu_payloads() {
+        let verify = verify_apdu(PIN_REF_USER, b"12345678");
         assert_eq!(
-            trace_apdu_text(&apdu),
-            "00 20 00 02 08 ** ** ** ** ** ** ** **"
+            trace_apdu_text(&verify),
+            "00 20 00 02 Lc=08 data=<redacted:8B>"
         );
         assert_eq!(
             trace_apdu_text(&[0x00, 0xA4, 0x00, 0x00, 0x02, 0x00, 0x3F, 0x00]),
-            "00 A4 00 00 02 00 3F 00"
+            "00 A4 00 00 Lc=02 data=<redacted:2B> Le=00"
         );
+        assert_eq!(trace_response(24, 0x9000), "<- data=24B SW=9000");
     }
 
     #[test]

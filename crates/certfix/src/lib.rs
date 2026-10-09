@@ -8,6 +8,55 @@ fn decode_csp_output(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| cp1251_to_string(bytes))
 }
 
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)
+}
+
+#[cfg(not(unix))]
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+#[cfg(unix)]
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(data)
+}
+
+#[cfg(not(unix))]
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)
+}
+
+pub fn write_private_once(path: &Path, data: &[u8]) -> Result<()> {
+    if let Ok(existing) = std::fs::read(path) {
+        if existing == data {
+            return Ok(());
+        }
+        bail!(
+            "{} уже существует и отличается от извлечённого: удалите или переименуйте файл",
+            path.display()
+        );
+    }
+    write_private(path, data).with_context(|| format!("не удалось записать {}", path.display()))?;
+    Ok(())
+}
+
 fn contains_success_marker(output: &[u8]) -> bool {
     output
         .windows(7)
@@ -246,10 +295,18 @@ fn backup_container(container_dir: &Path) -> Result<PathBuf> {
             ".{name}.tokentools-backup-{}-{attempt}",
             now_nanos()
         ));
-        match std::fs::create_dir(&backup) {
+        match create_private_dir(&backup) {
             Ok(()) => {
                 for file in CONTAINER_FILES {
-                    if let Err(error) = std::fs::copy(container_dir.join(file), backup.join(file)) {
+                    let data = match std::fs::read(container_dir.join(file)) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            let _ = std::fs::remove_dir_all(&backup);
+                            return Err(error)
+                                .with_context(|| format!("не удалось прочитать {file}"));
+                        }
+                    };
+                    if let Err(error) = write_private(&backup.join(file), &data) {
                         let _ = std::fs::remove_dir_all(&backup);
                         return Err(error)
                             .with_context(|| format!("не удалось сохранить backup файла {file}"));
@@ -366,13 +423,12 @@ fn find_csp_tool(name: &str) -> Result<PathBuf> {
 }
 
 fn copy_container(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir(dst)?;
     for file in CONTAINER_FILES {
         let source = src.join(file);
         if !source.is_file() {
             bail!("{}: отсутствует {file}", src.display());
         }
-        std::fs::copy(&source, dst.join(file))?;
+        write_private(&dst.join(file), &std::fs::read(&source)?)?;
     }
     Ok(())
 }
@@ -594,6 +650,39 @@ mod tests {
             decode_csp_output("Операция успешно завершена.".as_bytes()),
             "Операция успешно завершена."
         );
+    }
+
+    #[test]
+    fn copy_container_accepts_precreated_dir_and_uses_private_permissions() {
+        let base = std::env::temp_dir().join(format!("tokentools-copy-{}", now_nanos()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).expect("source dir");
+        std::fs::create_dir(&dst).expect("destination dir is created by the caller");
+        for file in CONTAINER_FILES {
+            std::fs::write(src.join(file), b"x").expect("source file");
+        }
+        copy_container(&src, &dst).expect("copy into an existing directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dst.join("name.key"))
+                .expect("copied file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "container files must stay owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn write_private_once_keeps_existing_different_file() {
+        let path = std::env::temp_dir().join(format!("tokentools-once-{}", now_nanos()));
+        write_private_once(&path, b"first").expect("first write");
+        write_private_once(&path, b"first").expect("identical content is fine");
+        assert!(write_private_once(&path, b"second").is_err());
+        assert_eq!(std::fs::read(&path).expect("file readable"), b"first");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

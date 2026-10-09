@@ -127,11 +127,11 @@ struct ScardIoRequest {
     pci_length: Dword,
 }
 type FnEstablish =
-    unsafe extern "C" fn(Dword, *const c_void, *const c_void, *mut ScardContext) -> Long;
-type FnRelease = unsafe extern "C" fn(ScardContext) -> Long;
+    unsafe extern "system" fn(Dword, *const c_void, *const c_void, *mut ScardContext) -> Long;
+type FnRelease = unsafe extern "system" fn(ScardContext) -> Long;
 type FnListReaders =
-    unsafe extern "C" fn(ScardContext, *const c_char, *mut c_char, *mut Dword) -> Long;
-type FnConnect = unsafe extern "C" fn(
+    unsafe extern "system" fn(ScardContext, *const c_char, *mut c_char, *mut Dword) -> Long;
+type FnConnect = unsafe extern "system" fn(
     ScardContext,
     *const c_char,
     Dword,
@@ -139,8 +139,8 @@ type FnConnect = unsafe extern "C" fn(
     *mut ScardHandle,
     *mut Dword,
 ) -> Long;
-type FnDisconnect = unsafe extern "C" fn(ScardHandle, Dword) -> Long;
-type FnTransmit = unsafe extern "C" fn(
+type FnDisconnect = unsafe extern "system" fn(ScardHandle, Dword) -> Long;
+type FnTransmit = unsafe extern "system" fn(
     ScardHandle,
     *const ScardIoRequest,
     *const u8,
@@ -187,8 +187,16 @@ impl Pcsc {
         unsafe {
             let establish = lib.symbol::<FnEstablish>(b"SCardEstablishContext\0")?;
             let release = lib.symbol::<FnRelease>(b"SCardReleaseContext\0")?;
-            let list_readers = lib.symbol::<FnListReaders>(b"SCardListReaders\0")?;
-            let connect = lib.symbol::<FnConnect>(b"SCardConnect\0")?;
+            let list_readers = if cfg!(windows) {
+                lib.symbol::<FnListReaders>(b"SCardListReadersA\0")?
+            } else {
+                lib.symbol::<FnListReaders>(b"SCardListReaders\0")?
+            };
+            let connect = if cfg!(windows) {
+                lib.symbol::<FnConnect>(b"SCardConnectA\0")?
+            } else {
+                lib.symbol::<FnConnect>(b"SCardConnect\0")?
+            };
             let disconnect = lib.symbol::<FnDisconnect>(b"SCardDisconnect\0")?;
             let transmit = lib.symbol::<FnTransmit>(b"SCardTransmit\0")?;
             Ok(Rc::new(Self {
@@ -342,5 +350,15 @@ impl Drop for Card {
             (self.pcsc.disconnect)(self.handle, SCARD_LEAVE_CARD);
             (self.pcsc.release)(self.ctx);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_windows_scard_exports() {
+        Pcsc::load().expect("WinSCard exports must resolve on Windows");
     }
 }

@@ -97,7 +97,12 @@ fn tlv_content(data: &[u8]) -> &[u8] {
         }
         (2 + n, v)
     };
-    let end = (start + len).min(data.len());
+    let end = start
+        .checked_add(len)
+        .map_or(data.len(), |end| end.min(data.len()));
+    if start > end {
+        return &[];
+    }
     &data[start..end]
 }
 pub fn parse_name_key(data: &[u8]) -> Option<String> {
@@ -194,6 +199,15 @@ mod tests {
     fn name_key_round_trip() {
         let data = build_name_key(&[0xC0, 0xE1, 0xB8]);
         assert_eq!(parse_name_key(&data).as_deref(), Some("Абё"));
+    }
+
+    #[test]
+    fn tlv_content_survives_malformed_length() {
+        assert_eq!(
+            tlv_content(&[0x30, 0x88, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
+            &[][..]
+        );
+        assert_eq!(tlv_content(&[0x30, 0x82, 0xFF, 0xFF, 0x01]), &[0x01][..]);
     }
 
     #[test]

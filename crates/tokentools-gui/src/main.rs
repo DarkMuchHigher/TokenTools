@@ -128,7 +128,9 @@ enum Msg {
     Status(String),
     Readers(Vec<String>),
     Containers(Vec<TokenContainer>),
-    PinFailed,
+    CardPresent(bool),
+    PinRequired,
+    PinVerificationFailed,
     Certs(Result<Vec<certfix::StoreCert>, String>),
     PollDone,
     Done,
@@ -154,7 +156,7 @@ fn palette(dark: bool) -> Palette {
             stroke: egui::Color32::from_rgb(0x32, 0x39, 0x43),
             text: egui::Color32::from_rgb(0xE7, 0xEA, 0xEE),
             muted: egui::Color32::from_rgb(0x96, 0xA0, 0xAC),
-            accent: egui::Color32::from_rgb(0x5B, 0x8D, 0xD6),
+            accent: egui::Color32::from_rgb(0x6B, 0x9B, 0xE0),
             ok: egui::Color32::from_rgb(0x6F, 0xBF, 0x73),
             err: egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
         }
@@ -166,7 +168,7 @@ fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_rgb(0x1E, 0x23, 0x29),
             muted: egui::Color32::from_rgb(0x66, 0x70, 0x7C),
             accent: egui::Color32::from_rgb(0x2E, 0x5C, 0x9E),
-            ok: egui::Color32::from_rgb(0x2E, 0x8B, 0x57),
+            ok: egui::Color32::from_rgb(0x1E, 0x7A, 0x4B),
             err: egui::Color32::from_rgb(0xC0, 0x39, 0x2B),
         }
     }
@@ -252,12 +254,14 @@ struct App {
     info_for: String,
     next_poll: f64,
     polling: bool,
+    card_present: bool,
     pin: String,
-    pin_failed: bool,
+    pin_action_required: bool,
     certs_query: String,
     certs: Vec<certfix::StoreCert>,
     certs_loaded: bool,
     certs_loading: bool,
+    certs_error: Option<String>,
 }
 
 fn log_dir() -> Option<PathBuf> {
@@ -268,11 +272,11 @@ fn log_dir() -> Option<PathBuf> {
     }
 }
 
-fn default_pin() -> String {
+fn configured_pin() -> String {
     std::env::var("TOKENTOOLS_PIN")
         .ok()
         .filter(|pin| !pin.is_empty())
-        .unwrap_or_else(|| "12345678".to_string())
+        .unwrap_or_default()
 }
 
 struct CertRow {
@@ -498,22 +502,38 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
     let _ = tx.send(Msg::Readers(readers.clone()));
     if readers.is_empty() {
         let _ = tx.send(Msg::Containers(Vec::new()));
+        let _ = tx.send(Msg::CardPresent(false));
         if announce {
             let _ = tx.send(Msg::Log(Level::Info, "Устройства не найдены".into()));
         }
         return;
     }
     let mut containers = Vec::new();
+    let mut card_present = false;
     for reader in readers {
-        let _ = tx.send(Msg::Log(Level::Info, format!("Устройство: {reader}")));
-        let _ = tx.send(Msg::Status(format!("Читаю {reader}…")));
+        if !silent {
+            let _ = tx.send(Msg::Log(Level::Info, format!("Устройство: {reader}")));
+        }
         let card = match pcsc.connect(&reader) {
             Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(Msg::Log(Level::Err, format!("{reader}: {e}")));
+                if !silent {
+                    let _ = tx.send(Msg::Log(Level::Info, format!("{reader}: {e}")));
+                }
                 continue;
             }
         };
+        card_present = true;
+        let _ = tx.send(Msg::CardPresent(true));
+        let _ = tx.send(Msg::Status(format!("Читаю {reader}…")));
+        if pin.is_empty() {
+            let _ = tx.send(Msg::Log(
+                Level::Err,
+                "  PIN не задан: введите PIN пользователя и нажмите «Обновить»".into(),
+            ));
+            let _ = tx.send(Msg::PinRequired);
+            continue;
+        }
         let log_tx = tx.clone();
         let log_sink = move |msg: &str| {
             let _ = log_tx.send(Msg::Log(Level::Trace, format!("  {msg}")));
@@ -530,7 +550,7 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
             }
             Err(e) => {
                 let _ = tx.send(Msg::Log(Level::Err, format!("  PIN: {e}")));
-                let _ = tx.send(Msg::PinFailed);
+                let _ = tx.send(Msg::PinVerificationFailed);
                 continue;
             }
         }
@@ -608,6 +628,9 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
             ));
             containers.push(TokenContainer { path, name, files });
         }
+    }
+    if !card_present {
+        let _ = tx.send(Msg::CardPresent(false));
     }
     let _ = tx.send(Msg::Containers(containers));
 }
@@ -699,12 +722,14 @@ impl App {
             info_for: String::new(),
             next_poll: 0.0,
             polling: false,
-            pin: default_pin(),
-            pin_failed: false,
+            card_present: false,
+            pin: configured_pin(),
+            pin_action_required: false,
             certs_query: String::new(),
             certs: Vec::new(),
             certs_loaded: false,
             certs_loading: false,
+            certs_error: None,
         };
         app.log(Level::Info, "TokenTools запущен".to_string());
         let tx = app.tx.clone();
@@ -786,14 +811,21 @@ impl App {
                 Msg::Status(s) => self.status = s,
                 Msg::Readers(r) => self.readers = r,
                 Msg::Containers(found) => self.token_containers = found,
-                Msg::PinFailed => self.pin_failed = true,
+                Msg::CardPresent(present) => self.card_present = present,
+                Msg::PinRequired | Msg::PinVerificationFailed => {
+                    self.pin_action_required = true;
+                }
                 Msg::Certs(result) => {
                     self.certs_loading = false;
                     self.certs_loaded = true;
                     match result {
-                        Ok(list) => self.certs = list,
+                        Ok(list) => {
+                            self.certs = list;
+                            self.certs_error = None;
+                        }
                         Err(error) => {
                             self.certs.clear();
+                            self.certs_error = Some(error.clone());
                             self.log(Level::Err, format!("certmgr: {error}"));
                         }
                     }
@@ -810,6 +842,8 @@ impl App {
     fn detect(&mut self, announce: bool) {
         self.readers.clear();
         self.token_containers.clear();
+        self.card_present = false;
+        self.pin_action_required = false;
         self.status = "Поиск устройств…".to_string();
         let pin = self.pin.clone();
         self.spawn(move |tx| detect_task(tx, announce, pin, false));
@@ -849,14 +883,14 @@ impl App {
                     std::process::id(),
                     certfix::now_nanos()
                 ));
-                if let Err(e) = std::fs::create_dir(&partial) {
+                if let Err(e) = certfix::create_private_dir(&partial) {
                     let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", partial.display())));
                     continue;
                 }
                 let mut ok = true;
                 for (name, data) in &c.files {
                     let path = partial.join(name);
-                    if let Err(e) = std::fs::write(&path, data) {
+                    if let Err(e) = certfix::write_private(&path, data) {
                         let _ = tx.send(Msg::Log(Level::Err, format!("  {}: {e}", path.display())));
                         ok = false;
                     }
@@ -959,7 +993,7 @@ impl App {
                 return;
             }
             let cert = dir.join("cert_exchange.cer");
-            if let Err(e) = std::fs::write(&cert, &certs.owner) {
+            if let Err(e) = certfix::write_private_once(&cert, &certs.owner) {
                 let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
                 return;
             }
@@ -1023,7 +1057,7 @@ impl App {
                 return;
             }
             let owner = dir.join("cert_exchange.cer");
-            if let Err(e) = std::fs::write(&owner, &certs.owner) {
+            if let Err(e) = certfix::write_private_once(&owner, &certs.owner) {
                 let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", owner.display())));
                 return;
             }
@@ -1038,7 +1072,7 @@ impl App {
             let mut chain = Vec::new();
             for (i, c) in certs.chain.iter().enumerate() {
                 let f = dir.join(format!("ca_chain_{i}.cer"));
-                if let Err(e) = std::fs::write(&f, c) {
+                if let Err(e) = certfix::write_private_once(&f, c) {
                     let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", f.display())));
                     return;
                 }
@@ -1113,8 +1147,8 @@ impl eframe::App for App {
         let now = ui.ctx().input(|i| i.time);
         if !self.busy
             && !self.polling
-            && !self.pin_failed
-            && self.readers.is_empty()
+            && !self.pin_action_required
+            && !self.card_present
             && now > self.next_poll
         {
             self.next_poll = now + 2.5;
@@ -1208,7 +1242,6 @@ impl App {
                 section_title(ui, &palette, "Устройство");
                 ui.horizontal(|ui| {
                     if ui.button("Обновить").clicked() {
-                        self.pin_failed = false;
                         self.detect(true);
                     }
                     ui.label(
@@ -1226,13 +1259,21 @@ impl App {
                             .desired_width(140.0),
                     );
                     ui.label(
-                        egui::RichText::new("по умолчанию 12345678")
+                        egui::RichText::new("задаётся токеном")
                             .size(12.5)
                             .color(palette.muted),
                     );
                 });
                 ui.add_space(4.0);
-                if self.readers.is_empty() {
+                if self.pin_action_required {
+                    ui.label(
+                        egui::RichText::new(
+                            "Введите PIN пользователя и нажмите «Обновить»: без него контейнеры не читаются.",
+                        )
+                        .color(palette.err),
+                    );
+                }
+                if !self.card_present {
                     ui.label(
                         egui::RichText::new(
                             "Токен не найден. Подключите его — контейнеры появятся сами.",
@@ -1427,6 +1468,18 @@ impl App {
                         ui.spinner();
                         ui.label(egui::RichText::new("Читаю хранилище…").color(palette.muted));
                     });
+                } else if let Some(error) = self.certs_error.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Не удалось прочитать хранилище uMy")
+                                .color(palette.err),
+                        );
+                        if ui.button("Повторить").clicked() {
+                            self.certs_loaded = false;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(error).size(12.0).color(palette.muted));
                 } else {
                     let query = self.certs_query.trim().to_lowercase();
                     let filtered: Vec<(usize, &certfix::StoreCert)> = self
@@ -1485,13 +1538,17 @@ impl App {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (level, line) in &self.log {
-                        let color = match level {
-                            Level::Info => palette.text,
-                            Level::Ok => palette.ok,
-                            Level::Err => palette.err,
-                            Level::Trace => palette.muted,
+                        let (mark, color) = match level {
+                            Level::Info => ("INF", palette.text),
+                            Level::Ok => ("OK ", palette.ok),
+                            Level::Err => ("ERR", palette.err),
+                            Level::Trace => ("TRC", palette.muted),
                         };
-                        ui.label(egui::RichText::new(line).color(color).size(13.0));
+                        ui.label(
+                            egui::RichText::new(format!("{mark}  {line}"))
+                                .color(color)
+                                .size(13.0),
+                        );
                     }
                 });
         });
