@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, bail};
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_long, c_ulong, c_void};
 use std::rc::Rc;
 
 mod dynlib {
@@ -105,6 +105,7 @@ mod dynlib {
         }
 
         pub unsafe fn symbol<T: Copy>(&self, name: &[u8]) -> anyhow::Result<T> {
+            const { assert!(std::mem::size_of::<T>() == std::mem::size_of::<*mut c_void>()) };
             let symbol =
                 unsafe { imp::symbol(self.handle, name) }.map_err(|e| anyhow::anyhow!(e))?;
             Ok(unsafe { std::mem::transmute_copy(&symbol) })
@@ -117,10 +118,10 @@ mod dynlib {
         }
     }
 }
+type Long = c_long;
+type Dword = c_ulong;
 type ScardContext = usize;
 type ScardHandle = usize;
-type Long = i32;
-type Dword = u32;
 #[repr(C)]
 struct ScardIoRequest {
     protocol: Dword,
@@ -174,29 +175,19 @@ impl Pcsc {
         } else {
             &["libpcsclite.so.1", "libpcsclite.so"]
         };
-        let mut lib = None;
-        for name in candidates {
-            if let Ok(candidate) = dynlib::Library::open(name) {
-                lib = Some(candidate);
-                break;
-            }
-        }
-        let lib = lib.ok_or_else(|| {
-            anyhow!("не удалось загрузить библиотеку PC/SC (искали: {candidates:?})")
-        })?;
+        let lib = candidates
+            .iter()
+            .find_map(|name| dynlib::Library::open(name).ok())
+            .ok_or_else(|| {
+                anyhow!("не удалось загрузить библиотеку PC/SC (искали: {candidates:?})")
+            })?;
+        let suffix: &[u8] = if cfg!(windows) { b"A\0" } else { b"\0" };
+        let name = |base: &[u8]| [base, suffix].concat();
         unsafe {
             let establish = lib.symbol::<FnEstablish>(b"SCardEstablishContext\0")?;
             let release = lib.symbol::<FnRelease>(b"SCardReleaseContext\0")?;
-            let list_readers = if cfg!(windows) {
-                lib.symbol::<FnListReaders>(b"SCardListReadersA\0")?
-            } else {
-                lib.symbol::<FnListReaders>(b"SCardListReaders\0")?
-            };
-            let connect = if cfg!(windows) {
-                lib.symbol::<FnConnect>(b"SCardConnectA\0")?
-            } else {
-                lib.symbol::<FnConnect>(b"SCardConnect\0")?
-            };
+            let list_readers = lib.symbol::<FnListReaders>(&name(b"SCardListReaders"))?;
+            let connect = lib.symbol::<FnConnect>(&name(b"SCardConnect"))?;
             let disconnect = lib.symbol::<FnDisconnect>(b"SCardDisconnect\0")?;
             let transmit = lib.symbol::<FnTransmit>(b"SCardTransmit\0")?;
             Ok(Rc::new(Self {
@@ -210,7 +201,7 @@ impl Pcsc {
             }))
         }
     }
-    pub fn list_readers(&self) -> Result<Vec<String>> {
+    fn establish_context(&self) -> Result<ScardContext> {
         let mut ctx: ScardContext = 0;
         let rc = unsafe {
             (self.establish)(
@@ -223,6 +214,10 @@ impl Pcsc {
         if rc != SCARD_SUCCESS {
             bail!(scard_err("SCardEstablishContext", rc));
         }
+        Ok(ctx)
+    }
+    pub fn list_readers(&self) -> Result<Vec<String>> {
+        let ctx = self.establish_context()?;
         let result = (|| -> Result<Vec<String>> {
             let mut len: Dword = 0;
             let rc = unsafe {
@@ -246,31 +241,17 @@ impl Pcsc {
             if rc != SCARD_SUCCESS {
                 bail!(scard_err("SCardListReaders", rc));
             }
-            let mut readers = Vec::new();
-            for part in buf.split(|b| *b == 0) {
-                if part.is_empty() {
-                    continue;
-                }
-                readers.push(String::from_utf8_lossy(part).into_owned());
-            }
-            Ok(readers)
+            Ok(buf
+                .split(|b| *b == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect())
         })();
         unsafe { (self.release)(ctx) };
         result
     }
     pub fn connect(self: &Rc<Self>, reader: &str) -> Result<Card> {
-        let mut ctx: ScardContext = 0;
-        let rc = unsafe {
-            (self.establish)(
-                SCARD_SCOPE_USER,
-                std::ptr::null(),
-                std::ptr::null(),
-                &mut ctx,
-            )
-        };
-        if rc != SCARD_SUCCESS {
-            bail!(scard_err("SCardEstablishContext", rc));
-        }
+        let ctx = self.establish_context()?;
         let creader = match CString::new(reader) {
             Ok(reader) => reader,
             Err(e) => {
@@ -360,5 +341,32 @@ mod tests {
     #[test]
     fn loads_windows_scard_exports() {
         Pcsc::load().expect("WinSCard exports must resolve on Windows");
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    #[test]
+    fn scard_types_follow_platform_long_width() {
+        assert_eq!(std::mem::size_of::<Long>(), std::mem::size_of::<c_long>());
+        assert_eq!(std::mem::size_of::<Dword>(), std::mem::size_of::<c_ulong>());
+        assert_eq!(
+            std::mem::size_of::<ScardIoRequest>(),
+            2 * std::mem::size_of::<c_ulong>()
+        );
+    }
+
+    #[test]
+    fn scard_handles_are_pointer_width() {
+        assert_eq!(
+            std::mem::size_of::<ScardContext>(),
+            std::mem::size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            std::mem::size_of::<ScardHandle>(),
+            std::mem::size_of::<*mut c_void>()
+        );
     }
 }

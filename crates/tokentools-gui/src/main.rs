@@ -1,15 +1,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+use cryptopro_container::{CONTAINER_FILES, hex_lower};
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Devices,
+    Token,
     Container,
+    Installed,
     Certs,
     Log,
 }
@@ -20,6 +22,17 @@ enum Level {
     Ok,
     Err,
     Trace,
+}
+
+impl Level {
+    fn mark(self) -> &'static str {
+        match self {
+            Level::Info => "INF",
+            Level::Ok => "OK ",
+            Level::Err => "ERR",
+            Level::Trace => "TRC",
+        }
+    }
 }
 
 fn now_hms() -> String {
@@ -38,22 +51,15 @@ fn now_hms() -> String {
 
 #[derive(Clone)]
 struct TokenContainer {
-    path: Vec<u16>,
+    reader: String,
+    container: rutoken_fs::Container,
     name: String,
     files: Vec<(String, Vec<u8>)>,
 }
 
 impl TokenContainer {
     fn folder(&self) -> String {
-        if self.path.is_empty() {
-            "корень".to_string()
-        } else {
-            self.path
-                .iter()
-                .map(|f| format!("{f:04x}"))
-                .collect::<Vec<_>>()
-                .join("-")
-        }
+        cryptopro_container::container_dir_name(Some(&self.name), self.container.folder)
     }
 
     fn size(&self) -> usize {
@@ -123,14 +129,20 @@ impl Picker {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ReaderState {
+    name: String,
+    token: bool,
+}
+
 enum Msg {
     Log(Level, String),
     Status(String),
-    Readers(Vec<String>),
+    Readers(Vec<ReaderState>),
     Containers(Vec<TokenContainer>),
     CardPresent(bool),
     PinRequired,
-    PinVerificationFailed,
+    StorageChanged,
     Certs(Result<Vec<certfix::StoreCert>, String>),
     PollDone,
     Done,
@@ -144,6 +156,7 @@ struct Palette {
     text: egui::Color32,
     muted: egui::Color32,
     accent: egui::Color32,
+    on_accent: egui::Color32,
     ok: egui::Color32,
     err: egui::Color32,
 }
@@ -157,6 +170,7 @@ fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_rgb(0xE7, 0xEA, 0xEE),
             muted: egui::Color32::from_rgb(0x96, 0xA0, 0xAC),
             accent: egui::Color32::from_rgb(0x6B, 0x9B, 0xE0),
+            on_accent: egui::Color32::from_rgb(0x10, 0x16, 0x1D),
             ok: egui::Color32::from_rgb(0x6F, 0xBF, 0x73),
             err: egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
         }
@@ -168,6 +182,7 @@ fn palette(dark: bool) -> Palette {
             text: egui::Color32::from_rgb(0x1E, 0x23, 0x29),
             muted: egui::Color32::from_rgb(0x66, 0x70, 0x7C),
             accent: egui::Color32::from_rgb(0x2E, 0x5C, 0x9E),
+            on_accent: egui::Color32::WHITE,
             ok: egui::Color32::from_rgb(0x1E, 0x7A, 0x4B),
             err: egui::Color32::from_rgb(0xC0, 0x39, 0x2B),
         }
@@ -217,7 +232,7 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
             w.open.weak_bg_fill = palette.card;
             style.spacing.item_spacing = egui::vec2(8.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.spacing.interact_size.y = 26.0;
+            style.spacing.interact_size.y = 28.0;
             style.spacing.scroll.bar_width = 8.0;
             use egui::{FontFamily::Proportional, FontId, TextStyle};
             style.text_styles = [
@@ -235,41 +250,22 @@ fn apply_theme(ctx: &egui::Context, dark: bool) {
     }
 }
 
-struct App {
-    tx: Sender<Msg>,
-    rx: Receiver<Msg>,
-    log: Vec<(Level, String)>,
-    readers: Vec<String>,
-    token_containers: Vec<TokenContainer>,
-    container_dir: String,
-    dump_dir: String,
-    page: Page,
-    busy: bool,
-    dark: bool,
-    applied_dark: bool,
-    app_icon: egui::TextureHandle,
-    picker: Option<Picker>,
-    status: String,
-    container_info: Option<ContainerInfo>,
-    info_for: String,
-    next_poll: f64,
-    polling: bool,
-    card_present: bool,
-    pin: String,
-    pin_action_required: bool,
-    certs_query: String,
-    certs: Vec<certfix::StoreCert>,
-    certs_loaded: bool,
-    certs_loading: bool,
-    certs_error: Option<String>,
-}
-
 fn log_dir() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("tokentools"))
     } else {
         std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache").join("tokentools"))
     }
+}
+
+fn open_session_log() -> Option<std::fs::File> {
+    let dir = log_dir()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("session.log"))
+        .ok()
 }
 
 fn configured_pin() -> String {
@@ -297,7 +293,7 @@ fn container_info(dir: &str) -> Option<ContainerInfo> {
     }
     let path = PathBuf::from(dir);
     let (name, certs) = cryptopro_container::read_container(&path).ok()?;
-    let files = cryptopro_container::CONTAINER_FILES
+    let files = CONTAINER_FILES
         .iter()
         .filter_map(|fname| {
             std::fs::metadata(path.join(fname))
@@ -358,8 +354,10 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn small(palette: &Palette, text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text.into())
+        .size(12.5)
+        .color(palette.muted)
 }
 
 fn days_chip(ui: &mut egui::Ui, palette: &Palette, not_after: &str) {
@@ -367,14 +365,14 @@ fn days_chip(ui: &mut egui::Ui, palette: &Palette, not_after: &str) {
         Some(days) if days < 0 => {
             ui.label(
                 egui::RichText::new("просрочен")
-                    .size(12.0)
+                    .size(12.5)
                     .color(palette.err),
             );
         }
         Some(days) if days <= 90 => {
             ui.label(
                 egui::RichText::new(format!("осталось {days} дн."))
-                    .size(12.0)
+                    .size(12.5)
                     .color(palette.accent),
             );
         }
@@ -382,30 +380,42 @@ fn days_chip(ui: &mut egui::Ui, palette: &Palette, not_after: &str) {
     }
 }
 
+fn fields(ui: &mut egui::Ui, palette: &Palette, id: &str, rows: &[(&str, String, bool)]) {
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([14.0, 4.0])
+        .show(ui, |ui| {
+            for (label, value, mono) in rows {
+                if value.is_empty() {
+                    continue;
+                }
+                ui.label(small(palette, *label));
+                let text = egui::RichText::new(value).size(12.5).color(palette.text);
+                ui.add(egui::Label::new(if *mono { text.monospace() } else { text }).wrap());
+                ui.end_row();
+            }
+        });
+}
+
 fn cert_block(ui: &mut egui::Ui, palette: &Palette, title: &str, row: &CertRow, detailed: bool) {
     ui.horizontal_wrapped(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .strong()
-                .size(13.0)
-                .color(palette.text),
-        );
-        let Some(cert) = &row.info else {
-            let note = if row.size == 0 {
-                "сертификат отсутствует"
-            } else {
-                "не разобран"
-            };
-            ui.label(egui::RichText::new(note).size(12.5).color(palette.err));
-            return;
-        };
-        let subject = cert
-            .subject_cn
-            .clone()
-            .unwrap_or_else(|| "(без CN)".to_string());
-        ui.label(egui::RichText::new(subject).size(13.0).color(palette.text));
-        if let Some(not_after) = &cert.not_after {
-            days_chip(ui, palette, not_after);
+        ui.label(egui::RichText::new(title).strong().color(palette.text));
+        match &row.info {
+            Some(cert) => {
+                let subject = cert.subject_cn.as_deref().unwrap_or("(без CN)");
+                ui.label(subject);
+                if let Some(not_after) = &cert.not_after {
+                    days_chip(ui, palette, not_after);
+                }
+            }
+            None => {
+                let note = if row.size == 0 {
+                    "сертификат отсутствует"
+                } else {
+                    "не удалось разобрать"
+                };
+                ui.label(egui::RichText::new(note).color(palette.err));
+            }
         }
     });
     let Some(cert) = &row.info else {
@@ -414,22 +424,26 @@ fn cert_block(ui: &mut egui::Ui, palette: &Palette, title: &str, row: &CertRow, 
     if !detailed {
         return;
     }
-    let field = |ui: &mut egui::Ui, label: &str, value: String, mono: bool| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(label).size(12.0).color(palette.muted));
-            let text = egui::RichText::new(value).size(12.0).color(palette.muted);
-            ui.label(if mono { text.monospace() } else { text });
-        });
+    let period = match (&cert.not_before, &cert.not_after) {
+        (Some(from), Some(to)) => format!("с {from} по {to}"),
+        _ => String::new(),
     };
-    if let Some(issuer) = &cert.issuer_cn {
-        field(ui, "Издатель:", issuer.clone(), false);
-    }
-    field(ui, "Серийный номер:", cert.serial_hex.clone(), true);
-    if let (Some(from), Some(to)) = (&cert.not_before, &cert.not_after) {
-        field(ui, "Действует:", format!("с {from} по {to}"), false);
-    }
-    field(ui, "SHA-1:", hex_lower(&cert.sha1), true);
-    field(ui, "SHA-256:", hex_lower(&cert.sha256), true);
+    fields(
+        ui,
+        palette,
+        &format!("cert-{title}"),
+        &[
+            (
+                "Издатель",
+                cert.issuer_cn.clone().unwrap_or_default(),
+                false,
+            ),
+            ("Серийный номер", cert.serial_hex.clone(), true),
+            ("Действует", period, false),
+            ("SHA-1", hex_lower(&cert.sha1), true),
+            ("SHA-256", hex_lower(&cert.sha256), true),
+        ],
+    );
 }
 
 fn cert_row(ui: &mut egui::Ui, palette: &Palette, index: usize, cert: &certfix::StoreCert) {
@@ -439,12 +453,16 @@ fn cert_row(ui: &mut egui::Ui, palette: &Palette, index: usize, cert: &certfix::
     let header = ui.horizontal(|ui| {
         let toggle = state.show_toggle_button(ui, egui::collapsing_header::paint_default_icon);
         let title = certfix::cn_from_dn(&cert.subject).unwrap_or_else(|| cert.subject.clone());
-        ui.label(egui::RichText::new(title).size(13.0).color(palette.text));
+        ui.label(title);
         if let Some(not_after) = &cert.not_after {
             days_chip(ui, palette, not_after);
         }
         if cert.has_key {
-            ui.label(egui::RichText::new("ключ").size(11.5).color(palette.ok));
+            ui.label(
+                egui::RichText::new("есть ключ")
+                    .size(12.5)
+                    .color(palette.ok),
+            );
         }
         toggle
     });
@@ -452,31 +470,128 @@ fn cert_row(ui: &mut egui::Ui, palette: &Palette, index: usize, cert: &certfix::
         state.toggle(ui);
     }
     state.show_body_indented(&header.response, ui, |ui| {
-        let field = |ui: &mut egui::Ui, label: &str, value: &str, mono: bool| {
-            if value.is_empty() {
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(label).size(12.0).color(palette.muted));
-                let text = egui::RichText::new(value).size(12.0).color(palette.muted);
-                ui.label(if mono { text.monospace() } else { text });
-            });
-        };
-        field(ui, "Субъект:", &cert.subject, false);
-        field(ui, "Издатель:", &cert.issuer, false);
-        field(ui, "Серийный номер:", &cert.serial, true);
-        field(ui, "SHA-1:", &cert.sha1, true);
-        if let Some(from) = &cert.not_before {
-            field(ui, "Выдан:", from, false);
-        }
-        if let Some(to) = &cert.not_after {
-            field(ui, "Истекает:", to, false);
-        }
-        if let Some(container) = &cert.container {
-            field(ui, "Контейнер:", container, true);
-        }
+        fields(
+            ui,
+            palette,
+            &format!("store-cert-{index}"),
+            &[
+                ("Субъект", cert.subject.clone(), false),
+                ("Издатель", cert.issuer.clone(), false),
+                ("Серийный номер", cert.serial.clone(), true),
+                ("SHA-1", cert.sha1.clone(), true),
+                ("Выдан", cert.not_before.clone().unwrap_or_default(), false),
+                (
+                    "Истекает",
+                    cert.not_after.clone().unwrap_or_default(),
+                    false,
+                ),
+                (
+                    "Контейнер",
+                    cert.container.clone().unwrap_or_default(),
+                    true,
+                ),
+            ],
+        );
     });
     ui.add_space(4.0);
+}
+
+fn card<R>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::NONE
+        .fill(palette.card)
+        .stroke(egui::Stroke::new(1.0, palette.stroke))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width() - 2.0);
+            if !title.is_empty() {
+                ui.label(egui::RichText::new(title).size(15.0).strong());
+                ui.add_space(4.0);
+            }
+            add(ui)
+        })
+        .inner
+}
+
+fn page_header(ui: &mut egui::Ui, palette: &Palette, title: &str, hint: &str) {
+    ui.label(egui::RichText::new(title).size(20.0).strong());
+    ui.label(small(palette, hint));
+    ui.add_space(10.0);
+}
+
+fn primary_button(ui: &mut egui::Ui, palette: &Palette, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(text).color(palette.on_accent).strong())
+            .fill(palette.accent),
+    )
+}
+
+fn danger_button(ui: &mut egui::Ui, palette: &Palette, text: &str) -> egui::Response {
+    ui.button(egui::RichText::new(text).color(palette.err))
+}
+
+fn action_button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    label: &str,
+    hint: &str,
+    primary: bool,
+) -> bool {
+    let button = if primary {
+        egui::Button::new(egui::RichText::new(label).color(palette.on_accent).strong())
+            .fill(palette.accent)
+    } else {
+        egui::Button::new(label)
+    };
+    let clicked = ui.add_sized([220.0, 30.0], button).clicked();
+    ui.add(egui::Label::new(small(palette, hint)).wrap());
+    ui.end_row();
+    clicked
+}
+
+fn path_row(ui: &mut egui::Ui, value: &mut String, hint: &str) -> bool {
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 110.0).max(160.0);
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .desired_width(width),
+        );
+        ui.button("Выбрать…").clicked()
+    })
+    .inner
+}
+
+fn emit(tx: &Sender<Msg>, level: Level, text: impl Into<String>) {
+    let _ = tx.send(Msg::Log(level, text.into()));
+}
+
+fn emit_lines(tx: &Sender<Msg>, text: &str) {
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        emit(tx, Level::Info, format!("  {}", line.trim_end()));
+    }
+}
+
+fn verify_task(tx: &Sender<Msg>, dir: &Path) {
+    emit(tx, Level::Info, format!("Проверка: {}", dir.display()));
+    match certfix::verify_container(dir) {
+        Ok(out) => {
+            emit_lines(tx, &out);
+            let ok = out.contains("Check container passed");
+            let text = if ok {
+                "Контейнер в порядке"
+            } else {
+                "Проверка не пройдена"
+            };
+            emit(tx, if ok { Level::Ok } else { Level::Err }, text);
+        }
+        Err(e) => emit(tx, Level::Err, format!("{e}")),
+    }
 }
 
 fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
@@ -499,7 +614,14 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
             return;
         }
     };
-    let _ = tx.send(Msg::Readers(readers.clone()));
+    let mut states: Vec<ReaderState> = readers
+        .iter()
+        .map(|name| ReaderState {
+            name: name.clone(),
+            token: false,
+        })
+        .collect();
+    let _ = tx.send(Msg::Readers(states.clone()));
     if readers.is_empty() {
         let _ = tx.send(Msg::Containers(Vec::new()));
         let _ = tx.send(Msg::CardPresent(false));
@@ -508,9 +630,9 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
         }
         return;
     }
-    let mut containers = Vec::new();
+    let mut containers_out = Vec::new();
     let mut card_present = false;
-    for reader in readers {
+    for (index, reader) in readers.into_iter().enumerate() {
         if !silent {
             let _ = tx.send(Msg::Log(Level::Info, format!("Устройство: {reader}")));
         }
@@ -524,12 +646,14 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
             }
         };
         card_present = true;
+        states[index].token = true;
+        let _ = tx.send(Msg::Readers(states.clone()));
         let _ = tx.send(Msg::CardPresent(true));
         let _ = tx.send(Msg::Status(format!("Читаю {reader}…")));
         if pin.is_empty() {
             let _ = tx.send(Msg::Log(
                 Level::Err,
-                "  PIN не задан: введите PIN пользователя и нажмите «Обновить»".into(),
+                "  PIN не задан: введите PIN пользователя и нажмите «Прочитать токен»".into(),
             ));
             let _ = tx.send(Msg::PinRequired);
             continue;
@@ -550,146 +674,132 @@ fn detect_task(tx: &Sender<Msg>, announce: bool, pin: String, silent: bool) {
             }
             Err(e) => {
                 let _ = tx.send(Msg::Log(Level::Err, format!("  PIN: {e}")));
-                let _ = tx.send(Msg::PinVerificationFailed);
+                let _ = tx.send(Msg::PinRequired);
                 continue;
             }
         }
-        match fs.select_mf() {
-            Ok((_, 0x9000)) => {
-                let _ = tx.send(Msg::Log(Level::Info, "  MF выбран (3F00)".into()));
-            }
-            Ok((_, sw)) => {
-                let _ = tx.send(Msg::Log(
-                    Level::Err,
-                    format!("  MF недоступен: SW={sw:04x}"),
-                ));
-                continue;
-            }
+        let containers = match fs.containers() {
+            Ok(c) => c,
             Err(e) => {
-                let _ = tx.send(Msg::Log(Level::Err, format!("  {e}")));
-                continue;
-            }
-        }
-        let trees = match fs.walk(6) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = tx.send(Msg::Log(Level::Err, format!("  обход ФС: {e}")));
+                let _ = tx.send(Msg::Log(Level::Err, format!("  поиск контейнеров: {e}")));
                 continue;
             }
         };
-        for (path, entries) in trees {
-            let folder = if path.is_empty() {
-                "корень".to_string()
-            } else {
-                path.iter()
-                    .map(|f| format!("{f:04x}"))
-                    .collect::<Vec<_>>()
-                    .join("-")
-            };
-            if entries.len() != 6 {
-                let _ = tx.send(Msg::Log(
-                    Level::Info,
-                    format!("  /{folder}/: {} объект(ов) — не контейнер", entries.len()),
-                ));
-                continue;
-            }
-            let mut files = Vec::with_capacity(entries.len());
-            let mut ok = true;
-            for (fname, entry) in rutoken_fs::CONTAINER_FILES.iter().zip(entries.iter()) {
-                match fs.read_file(entry.fid, entry.size) {
-                    Ok(blob) => {
-                        let _ = tx.send(Msg::Log(
-                            Level::Info,
-                            format!("  /{folder}/{fname}: {} байт", blob.len()),
-                        ));
-                        files.push((fname.to_string(), blob));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Msg::Log(Level::Err, format!("  /{folder}/{fname}: {e}")));
-                        ok = false;
-                    }
+        if containers.is_empty() {
+            let _ = tx.send(Msg::Log(Level::Info, "  контейнеры не найдены".into()));
+        }
+        for container in containers {
+            let folder = container.folder;
+            let files = match fs.read_container(&container) {
+                Ok(files) => files,
+                Err(e) => {
+                    let _ = tx.send(Msg::Log(
+                        Level::Err,
+                        format!("  контейнер {folder:04x} пропущен: {e}"),
+                    ));
+                    continue;
                 }
-            }
-            if !ok {
-                let _ = tx.send(Msg::Log(
-                    Level::Err,
-                    format!("Контейнер /{folder}/ пропущен: не удалось прочитать все файлы"),
-                ));
-                continue;
-            }
+            };
+            let files: Vec<(String, Vec<u8>)> = files
+                .into_iter()
+                .filter_map(|(role, data)| {
+                    cryptopro_container::file_name_by_role(role)
+                        .map(|name| (name.to_string(), data))
+                })
+                .collect();
             let name = files
                 .iter()
-                .find(|(n, _)| n == "name.key")
-                .and_then(|(_, d)| cryptopro_container::parse_name_key(d))
+                .find(|(name, _)| name == "name.key")
+                .and_then(|(_, data)| cryptopro_container::parse_name_key(data))
                 .unwrap_or_else(|| "без имени".to_string());
+            let dir = cryptopro_container::container_dir_name(Some(&name), folder);
+            for (fname, data) in &files {
+                let _ = tx.send(Msg::Log(
+                    Level::Info,
+                    format!("  /{dir}/{fname}: {} байт", data.len()),
+                ));
+            }
             let _ = tx.send(Msg::Log(
                 Level::Ok,
-                format!("Контейнер «{name}» (/{folder}/)"),
+                format!("Контейнер «{name}» (папка {folder:04x})"),
             ));
-            containers.push(TokenContainer { path, name, files });
+            containers_out.push(TokenContainer {
+                reader: reader.clone(),
+                container,
+                name,
+                files,
+            });
         }
     }
     if !card_present {
         let _ = tx.send(Msg::CardPresent(false));
     }
-    let _ = tx.send(Msg::Containers(containers));
-}
-
-fn card<R>(ui: &mut egui::Ui, palette: &Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::NONE
-        .fill(palette.card)
-        .stroke(egui::Stroke::new(1.0, palette.stroke))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(14))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width() - 2.0);
-            add(ui)
-        })
-        .inner
-}
-
-fn section_title(ui: &mut egui::Ui, palette: &Palette, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(15.0)
-            .color(palette.text)
-            .strong(),
-    );
-    ui.add_space(2.0);
-}
-
-fn primary_button(ui: &mut egui::Ui, palette: &Palette, text: &str) -> egui::Response {
-    let btn = egui::Button::new(
-        egui::RichText::new(text)
-            .color(egui::Color32::WHITE)
-            .strong(),
-    )
-    .fill(palette.accent);
-    ui.add(btn)
+    let _ = tx.send(Msg::Containers(containers_out));
 }
 
 fn nav_item(ui: &mut egui::Ui, palette: &Palette, current: &mut Page, page: Page, label: &str) {
     let selected = *current == page;
     let text = if selected {
-        egui::RichText::new(label)
-            .size(14.5)
-            .color(palette.accent)
-            .strong()
+        egui::RichText::new(label).color(palette.accent).strong()
     } else {
-        egui::RichText::new(label).size(14.5).color(palette.muted)
+        egui::RichText::new(label).color(palette.muted)
     };
     let fill = if selected {
         palette.accent.gamma_multiply(0.20)
     } else {
         egui::Color32::TRANSPARENT
     };
-    let resp = ui.add_sized(
+    let response = ui.add_sized(
         [ui.available_width(), 34.0],
         egui::Button::selectable(selected, text).fill(fill),
     );
-    if resp.clicked() {
+    if response.clicked() {
         *current = page;
     }
+}
+
+#[derive(Clone, PartialEq)]
+enum InstallTarget {
+    Store,
+    Flash(String),
+}
+
+struct App {
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
+    log: Vec<(Level, String)>,
+    log_file: Option<std::fs::File>,
+    readers: Vec<ReaderState>,
+    token_containers: Vec<TokenContainer>,
+    installed: Vec<certfix::StorageContainer>,
+    usb: Vec<certfix::UsbVolume>,
+    has_keys_dir: bool,
+    remove_confirm: Option<PathBuf>,
+    install_target: InstallTarget,
+    install_name: String,
+    install_link: bool,
+    container_dir: String,
+    dump_dir: String,
+    page: Page,
+    shown_page: Page,
+    busy: bool,
+    dark: bool,
+    applied_dark: bool,
+    app_icon: egui::TextureHandle,
+    picker: Option<Picker>,
+    status: String,
+    container_info: Option<ContainerInfo>,
+    info_for: String,
+    next_poll: f64,
+    polling: bool,
+    card_present: bool,
+    pin: String,
+    pin_action_required: bool,
+    certs_query: String,
+    certs: Vec<certfix::StoreCert>,
+    certs_loaded: bool,
+    certs_loading: bool,
+    certs_error: Option<String>,
 }
 
 impl App {
@@ -704,14 +814,22 @@ impl App {
             tx,
             rx,
             log: Vec::new(),
+            log_file: open_session_log(),
             readers: Vec::new(),
             token_containers: Vec::new(),
+            installed: Vec::new(),
+            usb: Vec::new(),
+            has_keys_dir: false,
+            remove_confirm: None,
+            install_target: InstallTarget::Store,
+            install_name: String::new(),
+            install_link: true,
             container_dir: String::new(),
-            dump_dir: std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join("TokenTools").display().to_string())
+            dump_dir: certfix::user_home()
+                .map(|home| home.join("TokenTools").display().to_string())
                 .unwrap_or_else(|| "TokenTools".into()),
-            page: Page::Devices,
+            page: Page::Token,
+            shown_page: Page::Log,
             busy: false,
             dark,
             applied_dark: dark,
@@ -741,13 +859,14 @@ impl App {
                     certfix::DependencyState::Notice => Level::Info,
                     certfix::DependencyState::Missing => Level::Err,
                 };
-                let _ = tx.send(Msg::Log(
+                emit(
+                    &tx,
                     level,
                     format!(
                         "Зависимость {}: {} (используется: {})",
                         check.name, check.detail, check.used_by
                     ),
-                ));
+                );
             }
             ctx.request_repaint();
         });
@@ -762,22 +881,9 @@ impl App {
     fn log(&mut self, level: Level, text: impl Into<String>) {
         let text = text.into();
         let time = now_hms();
-        if let Some(dir) = log_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("session.log"))
-            {
-                use std::io::Write;
-                let mark = match level {
-                    Level::Info => "INF",
-                    Level::Ok => "OK ",
-                    Level::Err => "ERR",
-                    Level::Trace => "TRC",
-                };
-                let _ = writeln!(f, "{time} {mark} {text}");
-            }
+        if let Some(file) = &mut self.log_file {
+            use std::io::Write;
+            let _ = writeln!(file, "{time} {} {text}", level.mark());
         }
         self.log.push((level, format!("{time}  {text}")));
         if self.log.len() > 2000 {
@@ -798,7 +904,7 @@ impl App {
             let tx2 = tx.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(&tx2)));
             if result.is_err() {
-                let _ = tx.send(Msg::Log(Level::Err, "Внутренняя ошибка операции".into()));
+                emit(&tx, Level::Err, "Внутренняя ошибка операции");
             }
             let _ = tx.send(Msg::Done);
         });
@@ -812,9 +918,8 @@ impl App {
                 Msg::Readers(r) => self.readers = r,
                 Msg::Containers(found) => self.token_containers = found,
                 Msg::CardPresent(present) => self.card_present = present,
-                Msg::PinRequired | Msg::PinVerificationFailed => {
-                    self.pin_action_required = true;
-                }
+                Msg::PinRequired => self.pin_action_required = true,
+                Msg::StorageChanged => self.refresh_installed(),
                 Msg::Certs(result) => {
                     self.certs_loading = false;
                     self.certs_loaded = true;
@@ -836,6 +941,18 @@ impl App {
                     self.status = "Готово".to_string();
                 }
             }
+        }
+    }
+
+    fn refresh_installed(&mut self) {
+        self.installed = certfix::storage_containers();
+        self.usb = certfix::usb_volumes();
+        self.has_keys_dir = certfix::csp_keys_dir().is_ok();
+        self.remove_confirm = None;
+        if let InstallTarget::Flash(uuid) = &self.install_target
+            && !self.usb.iter().any(|volume| &volume.uuid == uuid)
+        {
+            self.install_target = InstallTarget::Store;
         }
     }
 
@@ -865,63 +982,30 @@ impl App {
     }
 
     fn dump(&mut self, items: Vec<TokenContainer>) {
-        let dest = PathBuf::from(self.dump_dir.clone());
+        let dest = PathBuf::from(self.dump_dir.trim());
         if items.is_empty() {
             return;
         }
         self.status = "Сохранение контейнеров…".to_string();
         self.spawn(move |tx| {
-            if let Err(e) = std::fs::create_dir_all(&dest) {
-                let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", dest.display())));
-                return;
-            }
             for c in &items {
-                let out = dest.join(c.folder());
-                let partial = dest.join(format!(
-                    ".{}.partial-{}-{}",
-                    c.folder(),
-                    std::process::id(),
-                    certfix::now_nanos()
-                ));
-                if let Err(e) = certfix::create_private_dir(&partial) {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", partial.display())));
-                    continue;
-                }
-                let mut ok = true;
-                for (name, data) in &c.files {
-                    let path = partial.join(name);
-                    if let Err(e) = certfix::write_private(&path, data) {
-                        let _ = tx.send(Msg::Log(Level::Err, format!("  {}: {e}", path.display())));
-                        ok = false;
+                match certfix::save_container(&dest, &c.folder(), &c.files) {
+                    Ok(out) => {
+                        for (name, data) in &c.files {
+                            emit(
+                                tx,
+                                Level::Info,
+                                format!("  {}: {} байт", out.join(name).display(), data.len()),
+                            );
+                        }
+                        emit(
+                            tx,
+                            Level::Ok,
+                            format!("{}: сохранён в {}", c.name, out.display()),
+                        );
                     }
+                    Err(e) => emit(tx, Level::Err, format!("{}: {e:#}", c.name)),
                 }
-                if !ok {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    continue;
-                }
-                if out.exists() {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    let _ = tx.send(Msg::Log(
-                        Level::Err,
-                        format!("{} уже существует; перезапись запрещена", out.display()),
-                    ));
-                    continue;
-                }
-                if let Err(e) = std::fs::rename(&partial, &out) {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", out.display())));
-                    continue;
-                }
-                for (name, data) in &c.files {
-                    let _ = tx.send(Msg::Log(
-                        Level::Info,
-                        format!("  {}: {} байт", out.join(name).display(), data.len()),
-                    ));
-                }
-                let _ = tx.send(Msg::Log(
-                    Level::Ok,
-                    format!("{} — сохранено в {}", c.name, out.display()),
-                ));
             }
         });
     }
@@ -935,12 +1019,9 @@ impl App {
             self.log(Level::Err, "Укажите папку контейнера");
             return;
         }
-        let path = match PathBuf::from(dir).canonicalize() {
-            Ok(path) => path,
-            Err(_) => {
-                self.log(Level::Err, "Папка контейнера не найдена");
-                return;
-            }
+        let Ok(path) = PathBuf::from(dir).canonicalize() else {
+            self.log(Level::Err, "Папка контейнера не найдена");
+            return;
         };
         if !cryptopro_container::is_container_dir(&path) {
             self.log(Level::Err, "Неполный контейнер: нужны все 6 файлов");
@@ -949,33 +1030,14 @@ impl App {
         self.spawn(move |tx| f(tx, path));
     }
 
+    fn verify_dir(&mut self, dir: PathBuf) {
+        self.status = "Проверка контейнера…".to_string();
+        self.spawn(move |tx| verify_task(tx, &dir));
+    }
+
     fn verify(&mut self) {
         self.status = "Проверка контейнера…".to_string();
-        self.with_container_dir(|tx, dir| {
-            let _ = tx.send(Msg::Log(
-                Level::Info,
-                format!("Проверка: {}", dir.display()),
-            ));
-            match certfix::verify_container(&dir) {
-                Ok(out) => {
-                    for line in out.lines().filter(|l| !l.trim().is_empty()) {
-                        let _ = tx.send(Msg::Log(Level::Info, format!("  {}", line.trim_end())));
-                    }
-                    let ok = out.contains("Check container passed");
-                    let _ = tx.send(Msg::Log(
-                        if ok { Level::Ok } else { Level::Err },
-                        if ok {
-                            "Контейнер в порядке".to_string()
-                        } else {
-                            "Проверка не пройдена".to_string()
-                        },
-                    ));
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
-                }
-            }
-        });
+        self.with_container_dir(|tx, dir| verify_task(tx, &dir));
     }
 
     fn fix(&mut self) {
@@ -983,28 +1045,24 @@ impl App {
         self.with_container_dir(|tx, dir| {
             let certs = match cryptopro_container::read_container(&dir) {
                 Ok((_, c)) => c,
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
-                    return;
-                }
+                Err(e) => return emit(tx, Level::Err, format!("{e}")),
             };
             if certs.owner.is_empty() {
-                let _ = tx.send(Msg::Log(Level::Err, "В контейнере нет сертификата".into()));
-                return;
+                return emit(tx, Level::Err, "В контейнере нет сертификата");
             }
             let cert = dir.join("cert_exchange.cer");
             if let Err(e) = certfix::write_private_once(&cert, &certs.owner) {
-                let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
-                return;
+                return emit(tx, Level::Err, format!("{e}"));
             }
-            let _ = tx.send(Msg::Log(
+            emit(
+                tx,
                 Level::Info,
                 format!(
                     "Сертификат владельца: {} ({} байт)",
                     cert.display(),
                     certs.owner.len()
                 ),
-            ));
+            );
             match certfix::fix_container(&dir, &cert) {
                 Ok(out) => {
                     for line in out.lines().filter(|l| {
@@ -1015,26 +1073,13 @@ impl App {
                             && !t.starts_with("wine:")
                             && !t.starts_with("00")
                     }) {
-                        let _ = tx.send(Msg::Log(Level::Info, format!("  {}", line.trim())));
+                        emit(tx, Level::Info, format!("  {}", line.trim()));
                     }
-                    let _ = tx.send(Msg::Log(
-                        Level::Ok,
-                        "Ключ помечен экспортируемым".to_string(),
-                    ));
+                    emit(tx, Level::Ok, "Ключ помечен экспортируемым");
                 }
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
-                }
+                Err(e) => emit(tx, Level::Err, format!("{e}")),
             }
         });
-    }
-
-    fn extract_certs(&mut self) {
-        self.certs_flow(false);
-    }
-
-    fn install_certs(&mut self) {
-        self.certs_flow(true);
     }
 
     fn certs_flow(&mut self, install: bool) {
@@ -1047,39 +1092,35 @@ impl App {
         self.with_container_dir(move |tx, dir| {
             let (name, certs) = match cryptopro_container::read_container(&dir) {
                 Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{e}")));
-                    return;
-                }
+                Err(e) => return emit(tx, Level::Err, format!("{e}")),
             };
             if certs.owner.is_empty() {
-                let _ = tx.send(Msg::Log(Level::Err, "В контейнере нет сертификата".into()));
-                return;
+                return emit(tx, Level::Err, "В контейнере нет сертификата");
             }
             let owner = dir.join("cert_exchange.cer");
             if let Err(e) = certfix::write_private_once(&owner, &certs.owner) {
-                let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", owner.display())));
-                return;
+                return emit(tx, Level::Err, format!("{}: {e}", owner.display()));
             }
-            let _ = tx.send(Msg::Log(
+            emit(
+                tx,
                 Level::Ok,
                 format!(
                     "Сертификат сохранён: {} ({} байт)",
                     owner.display(),
                     certs.owner.len()
                 ),
-            ));
+            );
             let mut chain = Vec::new();
             for (i, c) in certs.chain.iter().enumerate() {
                 let f = dir.join(format!("ca_chain_{i}.cer"));
                 if let Err(e) = certfix::write_private_once(&f, c) {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("{}: {e}", f.display())));
-                    return;
+                    return emit(tx, Level::Err, format!("{}: {e}", f.display()));
                 }
-                let _ = tx.send(Msg::Log(
+                emit(
+                    tx,
                     Level::Info,
                     format!("  УЦ: {} ({} байт)", f.display(), c.len()),
-                ));
+                );
                 chain.push(f);
             }
             if !install {
@@ -1088,49 +1129,133 @@ impl App {
             let cname = name.unwrap_or_else(|| "unknown".into());
             let (out, mut all_ok) = match certfix::certmgr_install(&owner, Some(&cname), "uMy") {
                 Ok(result) => result,
-                Err(e) => {
-                    let _ = tx.send(Msg::Log(Level::Err, format!("Установка сертификата: {e}")));
-                    return;
-                }
+                Err(e) => return emit(tx, Level::Err, format!("Установка сертификата: {e}")),
             };
-            for line in out.lines().filter(|l| !l.trim().is_empty()) {
-                let _ = tx.send(Msg::Log(Level::Info, format!("  {}", line.trim_end())));
-            }
-            let _ = tx.send(Msg::Log(
+            emit_lines(tx, &out);
+            emit(
+                tx,
                 if all_ok { Level::Ok } else { Level::Err },
                 if all_ok {
-                    "Сертификат установлен".to_string()
+                    "Сертификат установлен"
                 } else {
-                    "Не удалось установить сертификат".to_string()
+                    "Не удалось установить сертификат"
                 },
-            ));
+            );
             for (i, f) in chain.iter().enumerate() {
                 let store = if i == 0 { "uRoot" } else { "uCA" };
                 match certfix::certmgr_install(f, None, store) {
                     Ok((out, ok)) => {
                         all_ok &= ok;
-                        for line in out.lines().filter(|l| !l.trim().is_empty()) {
-                            let _ = tx.send(Msg::Log(
-                                Level::Info,
-                                format!("  {}: {}", store, line.trim_end()),
-                            ));
-                        }
-                        let _ = tx.send(Msg::Log(
+                        emit_lines(tx, &out);
+                        emit(
+                            tx,
                             if ok { Level::Ok } else { Level::Err },
-                            format!("УЦ #{i} -> {store}: {}", if ok { "OK" } else { "ошибка" }),
-                        ));
+                            format!("УЦ #{i} в {store}: {}", if ok { "OK" } else { "ошибка" }),
+                        );
                     }
                     Err(e) => {
                         all_ok = false;
-                        let _ = tx.send(Msg::Log(Level::Err, format!("УЦ #{i} -> {store}: {e}")));
+                        emit(tx, Level::Err, format!("УЦ #{i} в {store}: {e}"));
                     }
                 }
             }
             if !all_ok {
-                let _ = tx.send(Msg::Log(
-                    Level::Err,
-                    "Не все сертификаты установлены".into(),
-                ));
+                emit(tx, Level::Err, "Не все сертификаты установлены");
+            }
+        });
+    }
+
+    fn install(&mut self) {
+        let target = self.install_target.clone();
+        let name = self.install_name.trim().to_string();
+        let link = self.install_link;
+        self.status = "Установка контейнера…".to_string();
+        self.with_container_dir(move |tx, dir| {
+            let dest = match target {
+                InstallTarget::Store => certfix::csp_keys_dir().map_err(|e| e.to_string()),
+                InstallTarget::Flash(uuid) => certfix::usb_volumes()
+                    .into_iter()
+                    .find(|volume| volume.uuid == uuid)
+                    .map(|volume| volume.mount)
+                    .ok_or_else(|| {
+                        "Флешка отключена: вставьте её и нажмите «Обновить список»".into()
+                    }),
+            };
+            let dest = match dest {
+                Ok(dest) => dest,
+                Err(e) => return emit(tx, Level::Err, e),
+            };
+            let name = (!name.is_empty()).then_some(name.as_str());
+            let deployed = match certfix::deploy_container(&dir, &dest, name) {
+                Ok(deployed) => deployed,
+                Err(e) => return emit(tx, Level::Err, format!("{e:#}")),
+            };
+            let _ = tx.send(Msg::StorageChanged);
+            emit(
+                tx,
+                Level::Ok,
+                format!("Установлен: {}", deployed.dir.display()),
+            );
+            let Some(csp_name) = deployed.csp_name else {
+                return emit(tx, Level::Err, "КриптоПро не видит этот каталог");
+            };
+            emit(
+                tx,
+                Level::Info,
+                format!("КриптоПро видит контейнер как {csp_name}"),
+            );
+            if !link {
+                return;
+            }
+            match certfix::link_certificate(&csp_name) {
+                Ok(out) => {
+                    emit_lines(tx, &out);
+                    emit(
+                        tx,
+                        Level::Ok,
+                        "Сертификат скопирован в uMy со ссылкой на ключ",
+                    );
+                }
+                Err(e) => emit(tx, Level::Err, format!("{e}")),
+            }
+        });
+    }
+
+    fn remove_installed(&mut self, dir: PathBuf) {
+        match certfix::remove_container(&dir) {
+            Ok(()) => self.log(Level::Ok, format!("Удалён: {}", dir.display())),
+            Err(error) => self.log(Level::Err, format!("{error:#}")),
+        }
+        self.refresh_installed();
+    }
+
+    fn install_installed_cert(&mut self, container: certfix::StorageContainer) {
+        self.status = "Установка сертификата…".to_string();
+        self.spawn(move |tx| {
+            let certs = match cryptopro_container::read_container(&container.dir) {
+                Ok((_, certs)) => certs,
+                Err(e) => return emit(tx, Level::Err, format!("{e}")),
+            };
+            if certs.owner.is_empty() {
+                return emit(tx, Level::Err, "В контейнере нет сертификата");
+            }
+            let temp =
+                std::env::temp_dir().join(format!("tokentools-{}.cer", certfix::now_nanos()));
+            if let Err(e) = certfix::write_private(&temp, &certs.owner) {
+                return emit(tx, Level::Err, format!("{e}"));
+            }
+            let result = certfix::certmgr_install(&temp, Some(&container.csp_name()), "uMy");
+            let _ = std::fs::remove_file(&temp);
+            match result {
+                Ok((out, ok)) => {
+                    emit_lines(tx, &out);
+                    if ok {
+                        emit(tx, Level::Ok, "Сертификат установлен в uMy");
+                    } else {
+                        emit(tx, Level::Err, "Не удалось установить сертификат");
+                    }
+                }
+                Err(e) => emit(tx, Level::Err, format!("{e}")),
             }
         });
     }
@@ -1142,6 +1267,12 @@ impl eframe::App for App {
         if self.applied_dark != self.dark {
             apply_theme(ui.ctx(), self.dark);
             self.applied_dark = self.dark;
+        }
+        if self.page != self.shown_page {
+            self.shown_page = self.page;
+            if matches!(self.page, Page::Container | Page::Installed) {
+                self.refresh_installed();
+            }
         }
         let palette = self.palette();
         let now = ui.ctx().input(|i| i.time);
@@ -1166,17 +1297,14 @@ impl eframe::App for App {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("TokenTools").size(17.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(if self.dark {
-                            "Светлая"
-                        } else {
-                            "Тёмная"
-                        })
-                        .clicked()
-                    {
+                    let label = if self.dark {
+                        "Светлая тема"
+                    } else {
+                        "Тёмная тема"
+                    };
+                    if ui.button(label).clicked() {
                         self.dark = !self.dark;
                     }
-                    ui.add_space(6.0);
                     if self.busy {
                         ui.spinner();
                     }
@@ -1188,17 +1316,9 @@ impl eframe::App for App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&self.status)
-                        .size(12.5)
-                        .color(palette.muted),
-                );
+                ui.label(small(&palette, self.status.clone()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .size(12.5)
-                            .color(palette.muted),
-                    );
+                    ui.label(small(&palette, format!("v{}", env!("CARGO_PKG_VERSION"))));
                 });
             });
             ui.add_space(2.0);
@@ -1206,11 +1326,18 @@ impl eframe::App for App {
 
         egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(196.0)
+            .exact_size(180.0)
             .show(ui, |ui| {
                 ui.add_space(10.0);
-                nav_item(ui, &palette, &mut self.page, Page::Devices, "Устройства");
+                nav_item(ui, &palette, &mut self.page, Page::Token, "Токен");
                 nav_item(ui, &palette, &mut self.page, Page::Container, "Контейнер");
+                nav_item(
+                    ui,
+                    &palette,
+                    &mut self.page,
+                    Page::Installed,
+                    "Установленные",
+                );
                 nav_item(ui, &palette, &mut self.page, Page::Certs, "Сертификаты");
                 nav_item(ui, &palette, &mut self.page, Page::Log, "Журнал");
             });
@@ -1218,10 +1345,17 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(10.0);
             match self.page {
-                Page::Devices => self.render_devices(ui),
-                Page::Container => self.render_container(ui),
                 Page::Certs => self.render_certs(ui),
                 Page::Log => self.render_log(ui),
+                page => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| match page {
+                            Page::Token => self.render_token(ui),
+                            Page::Container => self.render_container(ui),
+                            _ => self.render_installed(ui),
+                        });
+                }
             }
         });
 
@@ -1235,133 +1369,165 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn render_devices(&mut self, ui: &mut egui::Ui) {
+    fn render_token(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette();
+        page_header(
+            ui,
+            &palette,
+            "Токен",
+            "Контейнеры КриптоПро читаются с токена по PIN пользователя.",
+        );
         ui.add_enabled_ui(!self.busy, |ui| {
-            card(ui, &palette, |ui| {
-                section_title(ui, &palette, "Устройство");
-                ui.horizontal(|ui| {
-                    if ui.button("Обновить").clicked() {
-                        self.detect(true);
-                    }
-                    ui.label(
-                        egui::RichText::new("поиск выполняется автоматически")
-                            .size(12.5)
-                            .color(palette.muted),
-                    );
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("PIN пользователя").color(palette.muted));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pin)
-                            .password(true)
-                            .desired_width(140.0),
-                    );
-                    ui.label(
-                        egui::RichText::new("задаётся токеном")
-                            .size(12.5)
-                            .color(palette.muted),
-                    );
-                });
-                ui.add_space(4.0);
+            card(ui, &palette, "Устройство", |ui| {
+                egui::Grid::new("token-form")
+                    .num_columns(2)
+                    .spacing([14.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(small(&palette, "PIN пользователя"));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pin)
+                                    .password(true)
+                                    .desired_width(150.0),
+                            );
+                            if primary_button(ui, &palette, "Прочитать токен").clicked() {
+                                self.detect(true);
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.label(small(
+                    &palette,
+                    "Неверный PIN уменьшает счётчик попыток токена.",
+                ));
+                ui.add_space(6.0);
                 if self.pin_action_required {
                     ui.label(
                         egui::RichText::new(
-                            "Введите PIN пользователя и нажмите «Обновить»: без него контейнеры не читаются.",
+                            "Введите PIN пользователя и нажмите «Прочитать токен»: без него контейнеры не читаются.",
                         )
                         .color(palette.err),
                     );
                 }
-                if !self.card_present {
-                    ui.label(
-                        egui::RichText::new(
-                            "Токен не найден. Подключите его — контейнеры появятся сами.",
-                        )
-                        .color(palette.muted),
-                    );
-                } else {
-                    for r in &self.readers {
-                        ui.label(egui::RichText::new(format!("• {r}")).color(palette.text));
-                    }
+                if self.readers.is_empty() {
+                    ui.label(small(
+                        &palette,
+                        "Считыватели не найдены. Подключите токен: список обновляется сам.",
+                    ));
+                }
+                for reader in &self.readers {
+                    ui.horizontal(|ui| {
+                        ui.label(&reader.name);
+                        let (mark, color) = if reader.token {
+                            ("токен найден", palette.ok)
+                        } else {
+                            ("токена нет", palette.muted)
+                        };
+                        ui.label(egui::RichText::new(mark).size(12.5).color(color));
+                    });
                 }
             });
+            ui.add_space(12.0);
+            self.render_token_containers(ui, &palette);
+        });
+    }
 
-            ui.add_space(10.0);
-
-            card(ui, &palette, |ui| {
-                section_title(ui, &palette, "Контейнеры на токене");
-                if self.token_containers.is_empty() {
-                    ui.label(egui::RichText::new("Пока ничего не найдено").color(palette.muted));
-                    return;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("найдено: {}", self.token_containers.len()))
-                            .color(palette.muted),
-                    );
-                    if ui.button("Выгрузить все").clicked() {
-                        let items = self.token_containers.clone();
-                        self.dump(items);
+    fn render_token_containers(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(ui, palette, "Контейнеры на токене", |ui| {
+            if self.token_containers.is_empty() {
+                ui.label(small(
+                    palette,
+                    "Контейнеров пока нет. Введите PIN и прочитайте токен.",
+                ));
+                return;
+            }
+            ui.label(small(palette, "Сохранить в папку"));
+            if path_row(ui, &mut self.dump_dir, "Папка для сохранения") {
+                self.picker = Some(Picker::new(PickFor::Dump, &self.dump_dir));
+            }
+            ui.add_space(8.0);
+            let mut save: Option<TokenContainer> = None;
+            let mut save_all = false;
+            let mut open_dir: Option<String> = None;
+            let several = self.readers.iter().filter(|r| r.token).count() > 1;
+            egui::Grid::new("token-containers")
+                .striped(true)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    for head in ["Имя", "Папка", "Размер"] {
+                        ui.label(small(palette, head));
                     }
-                });
-                ui.add_space(4.0);
-                let mut dump_one: Option<TokenContainer> = None;
-                egui::Grid::new("containers")
-                    .striped(true)
-                    .min_col_width(90.0)
-                    .spacing([14.0, 6.0])
-                    .show(ui, |ui| {
-                        for h in ["Папка", "Имя контейнера", "Размер", ""] {
-                            ui.label(egui::RichText::new(h).color(palette.muted).size(12.5));
-                        }
-                        ui.end_row();
-                        for c in &self.token_containers {
-                            ui.label(c.folder());
-                            ui.label(&c.name);
-                            ui.label(format!("{} КБ", c.size() / 1024));
-                            if ui.button("Выгрузить").clicked() {
-                                dump_one = Some(c.clone());
-                            }
-                            ui.end_row();
+                    if several {
+                        ui.label(small(palette, "Токен"));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Сохранить все").clicked() {
+                            save_all = true;
                         }
                     });
-                if let Some(c) = dump_one {
-                    self.dump(vec![c]);
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Сохранять в").color(palette.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.dump_dir).desired_width(340.0));
-                    if ui.button("Выбрать…").clicked() {
-                        self.picker = Some(Picker::new(PickFor::Dump, &self.dump_dir));
+                    ui.end_row();
+                    for c in &self.token_containers {
+                        ui.add(egui::Label::new(&c.name).truncate());
+                        ui.label(
+                            egui::RichText::new(format!("{:04x}", c.container.folder)).monospace(),
+                        );
+                        ui.label(human_size(c.size() as u64));
+                        if several {
+                            ui.label(small(palette, c.reader.clone()));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Сохранить").clicked() {
+                                save = Some(c.clone());
+                            }
+                            let dir = PathBuf::from(self.dump_dir.trim()).join(c.folder());
+                            let exists = dir.is_dir();
+                            if ui
+                                .add_enabled(exists, egui::Button::new("Открыть"))
+                                .on_hover_text("Открыть сохранённый контейнер")
+                                .on_disabled_hover_text("Сначала сохраните контейнер")
+                                .clicked()
+                            {
+                                open_dir = Some(dir.display().to_string());
+                            }
+                        });
+                        ui.end_row();
                     }
                 });
-            });
+            if save_all {
+                self.dump(self.token_containers.clone());
+            }
+            if let Some(c) = save {
+                self.dump(vec![c]);
+            }
+            if let Some(dir) = open_dir {
+                self.container_dir = dir;
+                self.page = Page::Container;
+            }
         });
     }
 
     fn render_container(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette();
+        page_header(
+            ui,
+            &palette,
+            "Контейнер",
+            "Работа с сохранённым контейнером: проверка, сертификаты, установка в КриптоПро.",
+        );
         ui.add_enabled_ui(!self.busy, |ui| {
-            card(ui, &palette, |ui| {
-                section_title(ui, &palette, "Папка контейнера");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.container_dir).desired_width(360.0),
-                    );
-                    if ui.button("Выбрать…").clicked() {
-                        let start = if self.container_dir.is_empty() {
-                            std::env::var_os("HOME")
-                                .or_else(|| std::env::var_os("USERPROFILE"))
-                                .map(|home| PathBuf::from(home).display().to_string())
-                                .unwrap_or_else(|| "/".into())
-                        } else {
-                            self.container_dir.clone()
-                        };
-                        self.picker = Some(Picker::new(PickFor::Container, &start));
-                    }
-                });
+            card(ui, &palette, "Папка контейнера", |ui| {
+                if path_row(
+                    ui,
+                    &mut self.container_dir,
+                    "Папка с шестью файлами контейнера",
+                ) {
+                    let start = if self.container_dir.trim().is_empty() {
+                        self.dump_dir.clone()
+                    } else {
+                        self.container_dir.clone()
+                    };
+                    self.picker = Some(Picker::new(PickFor::Container, &start));
+                }
                 if self.info_for != self.container_dir {
                     self.info_for = self.container_dir.clone();
                     self.container_info = container_info(&self.container_dir);
@@ -1369,93 +1535,314 @@ impl App {
                 ui.add_space(6.0);
                 match &self.container_info {
                     Some(info) => {
-                        if let Some(name) = &info.name {
-                            ui.label(
-                                egui::RichText::new(format!("Имя: {name}"))
-                                    .size(13.0)
-                                    .color(palette.text),
-                            );
-                        }
-                        if !info.files.is_empty() {
-                            let files = info
-                                .files
-                                .iter()
-                                .map(|(name, size)| format!("{name} {}", human_size(*size)))
-                                .collect::<Vec<_>>()
-                                .join("   ·   ");
-                            ui.label(
-                                egui::RichText::new(format!("Файлы: {files}"))
-                                    .size(12.0)
-                                    .color(palette.muted),
-                            );
-                        }
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Проверить").clicked() {
-                                self.verify();
-                            }
-                            if primary_button(ui, &palette, "Сделать экспортируемым").clicked()
-                            {
-                                self.fix();
-                            }
-                            if ui.button("Извлечь сертификаты").clicked() {
-                                self.extract_certs();
-                            }
-                            if ui.button("Установить сертификаты").clicked() {
-                                self.install_certs();
-                            }
-                        });
+                        let files = info
+                            .files
+                            .iter()
+                            .map(|(name, size)| format!("{name} {}", human_size(*size)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        fields(
+                            ui,
+                            &palette,
+                            "container-info",
+                            &[
+                                ("Имя", info.name.clone().unwrap_or_default(), false),
+                                ("Файлы", files, false),
+                            ],
+                        );
                     }
                     None => {
                         let text = if self.container_dir.trim().is_empty() {
-                            "Укажите папку с файлами контейнера"
-                        } else if !std::path::Path::new(&self.container_dir).is_dir() {
-                            "Папка не найдена"
+                            "Укажите папку, которую сохранили со вкладки «Токен»."
+                        } else if !Path::new(self.container_dir.trim()).is_dir() {
+                            "Папка не найдена. Проверьте путь."
                         } else {
-                            "В папке нет шестифайлового контейнера"
+                            "В папке нет контейнера: нужны все шесть файлов."
                         };
-                        ui.label(egui::RichText::new(text).size(12.5).color(palette.muted));
+                        ui.label(small(&palette, text));
                     }
                 }
             });
+            if self.container_info.is_none() {
+                return;
+            }
+            ui.add_space(12.0);
             if let Some(info) = &self.container_info {
-                ui.add_space(10.0);
-                card(ui, &palette, |ui| {
-                    section_title(ui, &palette, "Сертификаты");
-                    ui.add_space(4.0);
+                card(ui, &palette, "Сертификаты", |ui| {
                     cert_block(ui, &palette, "Владелец", &info.owner, true);
                     for (i, cert) in info.chain.iter().enumerate() {
                         ui.add_space(6.0);
                         cert_block(ui, &palette, &format!("УЦ #{i}"), cert, false);
                     }
                 });
+                ui.add_space(12.0);
             }
+            card(ui, &palette, "Действия", |ui| {
+                let (mut verify, mut fix, mut extract, mut install) = (false, false, false, false);
+                egui::Grid::new("container-actions")
+                    .num_columns(2)
+                    .spacing([14.0, 8.0])
+                    .show(ui, |ui| {
+                        verify = action_button(
+                            ui,
+                            &palette,
+                            "Проверить",
+                            "Открыть контейнер через КриптоПро и проверить ключ.",
+                            false,
+                        );
+                        fix = action_button(
+                            ui,
+                            &palette,
+                            "Сделать экспортируемым",
+                            "CertFix: перед изменением создаётся резервная копия.",
+                            true,
+                        );
+                        extract = action_button(
+                            ui,
+                            &palette,
+                            "Извлечь сертификаты",
+                            "Сохранить файлы .cer в папку контейнера.",
+                            false,
+                        );
+                        install = action_button(
+                            ui,
+                            &palette,
+                            "Установить сертификаты",
+                            "Добавить в хранилища uMy, uRoot и uCA.",
+                            false,
+                        );
+                    });
+                if verify {
+                    self.verify();
+                }
+                if fix {
+                    self.fix();
+                }
+                if extract {
+                    self.certs_flow(false);
+                }
+                if install {
+                    self.certs_flow(true);
+                }
+            });
+            ui.add_space(12.0);
+            self.render_install_card(ui, &palette);
+        });
+    }
+
+    fn render_install_card(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        card(
+            ui,
+            palette,
+            "Установить в КриптоПро",
+            |ui| {
+                ui.label(small(
+                palette,
+                "После установки КриптоПро увидит контейнер как обычный носитель, и им можно подписывать.",
+            ));
+                ui.add_space(6.0);
+                let mut refresh = false;
+                ui.radio_value(
+                    &mut self.install_target,
+                    InstallTarget::Store,
+                    "Хранилище КриптоПро (HDIMAGE)",
+                );
+                for volume in &self.usb {
+                    ui.radio_value(
+                        &mut self.install_target,
+                        InstallTarget::Flash(volume.uuid.clone()),
+                        format!("Флешка {} ({})", volume.label(), volume.uuid),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if self.usb.is_empty() {
+                        ui.label(small(
+                        palette,
+                        "Флешка не найдена. Вставьте её, дождитесь монтирования и обновите список.",
+                    ));
+                    }
+                    refresh = ui.button("Обновить список").clicked();
+                });
+                ui.add_space(6.0);
+                egui::Grid::new("install-form")
+                    .num_columns(2)
+                    .spacing([14.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(small(palette, "Имя контейнера"));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.install_name)
+                                .hint_text("как в name.key")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                    });
+                ui.label(small(
+                palette,
+                "Имя должно быть уникальным: при совпадении с токеном КриптоПро выберет токен и запросит PIN.",
+            ));
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.install_link,
+                    "Привязать сертификат владельца к контейнеру (uMy)",
+                );
+                ui.add_space(6.0);
+                if primary_button(ui, palette, "Установить").clicked() {
+                    self.install();
+                }
+                if refresh {
+                    self.refresh_installed();
+                }
+            },
+        );
+    }
+
+    fn render_installed(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette();
+        page_header(
+            ui,
+            &palette,
+            "Установленные",
+            "Контейнеры, которые КриптоПро видит в своём хранилище и на флешках.",
+        );
+        ui.add_enabled_ui(!self.busy, |ui| {
+            card(ui, &palette, "", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Обновить").clicked() {
+                        self.refresh_installed();
+                    }
+                    ui.label(small(
+                        &palette,
+                        format!("Контейнеров: {}", self.installed.len()),
+                    ));
+                });
+                ui.add_space(6.0);
+                if !self.has_keys_dir {
+                    ui.label(
+                        egui::RichText::new(
+                            "Хранилище КриптоПро не найдено. Установите КриптоПро CSP.",
+                        )
+                        .color(palette.err),
+                    );
+                }
+                if self.installed.is_empty() {
+                    ui.label(small(
+                        &palette,
+                        "Здесь пока пусто. Установите контейнер на вкладке «Контейнер».",
+                    ));
+                    return;
+                }
+                let mut verify: Option<PathBuf> = None;
+                let mut cert: Option<certfix::StorageContainer> = None;
+                let mut ask_remove: Option<PathBuf> = None;
+                let mut remove: Option<PathBuf> = None;
+                let mut cancel = false;
+                egui::Grid::new("installed")
+                    .striped(true)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        for head in ["Контейнер", "Где", "Файлы", ""] {
+                            ui.label(small(&palette, head));
+                        }
+                        ui.end_row();
+                        for container in &self.installed {
+                            let name = container
+                                .container_name()
+                                .unwrap_or_else(|| container.name.clone());
+                            ui.vertical(|ui| {
+                                ui.label(name);
+                                ui.label(
+                                    egui::RichText::new(container.csp_name())
+                                        .size(12.0)
+                                        .monospace()
+                                        .color(palette.muted),
+                                );
+                            });
+                            ui.label(match &container.volume {
+                                None => "Хранилище КриптоПро".to_string(),
+                                Some(uuid) => self
+                                    .usb
+                                    .iter()
+                                    .find(|volume| &volume.uuid == uuid)
+                                    .map_or_else(
+                                        || format!("Флешка {uuid}"),
+                                        |v| format!("Флешка {}", v.label()),
+                                    ),
+                            });
+                            if container.is_complete() {
+                                ui.label(egui::RichText::new("6 из 6").color(palette.ok));
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(format!("{} из 6", container.files))
+                                        .color(palette.err),
+                                );
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Проверить").clicked() {
+                                    verify = Some(container.dir.clone());
+                                }
+                                if ui.button("Сертификат в uMy").clicked() {
+                                    cert = Some(container.clone());
+                                }
+                                if self.remove_confirm.as_ref() == Some(&container.dir) {
+                                    if danger_button(ui, &palette, "Удалить безвозвратно").clicked()
+                                    {
+                                        remove = Some(container.dir.clone());
+                                    }
+                                    if ui.button("Отмена").clicked() {
+                                        cancel = true;
+                                    }
+                                } else if danger_button(ui, &palette, "Удалить").clicked() {
+                                    ask_remove = Some(container.dir.clone());
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                if cancel {
+                    self.remove_confirm = None;
+                }
+                if let Some(dir) = ask_remove {
+                    self.remove_confirm = Some(dir);
+                }
+                if let Some(dir) = remove {
+                    self.remove_installed(dir);
+                }
+                if let Some(container) = cert {
+                    self.install_installed_cert(container);
+                }
+                if let Some(dir) = verify {
+                    self.verify_dir(dir);
+                }
+            });
         });
     }
 
     fn render_certs(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette();
+        page_header(
+            ui,
+            &palette,
+            "Сертификаты",
+            "Личные сертификаты КриптоПро из хранилища uMy.",
+        );
         ui.add_enabled_ui(!self.busy, |ui| {
-            card(ui, &palette, |ui| {
+            card(ui, &palette, "", |ui| {
                 ui.horizontal(|ui| {
-                    section_title(ui, &palette, "Личные сертификаты (uMy)");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Обновить").clicked() {
-                            self.certs_loaded = false;
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Поиск:").color(palette.muted));
-                    ui.add(egui::TextEdit::singleline(&mut self.certs_query).desired_width(300.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.certs_query)
+                            .hint_text("Поиск по субъекту, издателю, серийному номеру")
+                            .desired_width(340.0),
+                    );
                     if !self.certs_query.is_empty() && ui.button("Сбросить").clicked() {
                         self.certs_query.clear();
+                    }
+                    if ui.button("Обновить").clicked() {
+                        self.certs_loaded = false;
                     }
                 });
                 if !self.certs_loaded && !self.certs_loading {
                     self.certs_loading = true;
-                    self.status = "Читаю uMy…".to_string();
+                    self.status = "Чтение хранилища uMy…".to_string();
                     self.spawn(move |tx| {
                         let result =
                             certfix::certmgr_list("uMy").map_err(|error| error.to_string());
@@ -1466,20 +1853,19 @@ impl App {
                 if self.certs_loading {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(egui::RichText::new("Читаю хранилище…").color(palette.muted));
+                        ui.label(small(&palette, "Читаю хранилище…"));
                     });
                 } else if let Some(error) = self.certs_error.clone() {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new("Не удалось прочитать хранилище uMy")
+                            egui::RichText::new("Не удалось прочитать хранилище uMy.")
                                 .color(palette.err),
                         );
                         if ui.button("Повторить").clicked() {
                             self.certs_loaded = false;
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(error).size(12.0).color(palette.muted));
+                    ui.add(egui::Label::new(small(&palette, error)).wrap());
                 } else {
                     let query = self.certs_query.trim().to_lowercase();
                     let filtered: Vec<(usize, &certfix::StoreCert)> = self
@@ -1488,19 +1874,27 @@ impl App {
                         .enumerate()
                         .filter(|(_, cert)| {
                             query.is_empty()
-                                || cert.subject.to_lowercase().contains(&query)
-                                || cert.issuer.to_lowercase().contains(&query)
-                                || cert.serial.to_lowercase().contains(&query)
-                                || cert.sha1.to_lowercase().contains(&query)
+                                || [&cert.subject, &cert.issuer, &cert.serial, &cert.sha1]
+                                    .iter()
+                                    .any(|field| field.to_lowercase().contains(&query))
                         })
                         .collect();
-                    let counter = if query.is_empty() {
-                        format!("сертификатов: {}", self.certs.len())
+                    if self.certs.is_empty() {
+                        ui.label(small(
+                            &palette,
+                            "В хранилище uMy нет сертификатов. Установите их на вкладке «Контейнер».",
+                        ));
+                    } else if filtered.is_empty() {
+                        ui.label(small(&palette, format!("По запросу «{}» ничего не найдено.", self.certs_query.trim())));
                     } else {
-                        format!("показано {} из {}", filtered.len(), self.certs.len())
-                    };
-                    ui.label(egui::RichText::new(counter).size(12.0).color(palette.muted));
-                    ui.add_space(6.0);
+                        let counter = if query.is_empty() {
+                            format!("Сертификатов: {}", self.certs.len())
+                        } else {
+                            format!("Показано {} из {}", filtered.len(), self.certs.len())
+                        };
+                        ui.label(small(&palette, counter));
+                        ui.add_space(6.0);
+                    }
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -1515,39 +1909,41 @@ impl App {
 
     fn render_log(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette();
-        card(ui, &palette, |ui| {
-            ui.horizontal(|ui| {
-                section_title(ui, &palette, "Журнал");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Очистить").clicked() {
-                        self.log.clear();
-                    }
-                });
-            });
-            let log_path = log_dir()
-                .map(|dir| dir.join("session.log").display().to_string())
-                .unwrap_or_else(|| "session.log".to_string());
-            ui.label(
-                egui::RichText::new(format!("полный журнал: {log_path}"))
-                    .size(12.0)
-                    .color(palette.muted),
-            );
-            ui.add_space(4.0);
+        page_header(
+            ui,
+            &palette,
+            "Журнал",
+            &format!(
+                "Полный журнал: {}",
+                log_dir()
+                    .map(|dir| dir.join("session.log").display().to_string())
+                    .unwrap_or_else(|| "session.log".to_string())
+            ),
+        );
+        card(ui, &palette, "", |ui| {
+            if ui.button("Очистить").clicked() {
+                self.log.clear();
+            }
+            ui.add_space(6.0);
+            if self.log.is_empty() {
+                ui.label(small(&palette, "Журнал пуст."));
+            }
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for (level, line) in &self.log {
-                        let (mark, color) = match level {
-                            Level::Info => ("INF", palette.text),
-                            Level::Ok => ("OK ", palette.ok),
-                            Level::Err => ("ERR", palette.err),
-                            Level::Trace => ("TRC", palette.muted),
+                        let color = match level {
+                            Level::Info => palette.text,
+                            Level::Ok => palette.ok,
+                            Level::Err => palette.err,
+                            Level::Trace => palette.muted,
                         };
                         ui.label(
-                            egui::RichText::new(format!("{mark}  {line}"))
-                                .color(color)
-                                .size(13.0),
+                            egui::RichText::new(format!("{}  {line}", level.mark()))
+                                .monospace()
+                                .size(12.5)
+                                .color(color),
                         );
                     }
                 });
@@ -1556,65 +1952,57 @@ impl App {
 
     fn render_picker(&mut self, ui: &mut egui::Ui) {
         let palette = self.palette();
-        if let Some(picker) = &mut self.picker {
-            let mut close = false;
-            let mut chosen: Option<PathBuf> = None;
-            egui::Window::new("Выбор папки")
-                .collapsible(false)
-                .resizable(true)
-                .default_size([560.0, 420.0])
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ui.ctx(), |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("↑").clicked() {
-                            picker.go_to_parent();
-                        }
-                        ui.label(
-                            egui::RichText::new(picker.path.display().to_string())
-                                .color(palette.muted)
-                                .size(12.5),
-                        );
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            for d in picker.dirs.clone() {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width(), 26.0],
-                                        egui::Button::new(format!("  {d}"))
-                                            .fill(egui::Color32::TRANSPARENT),
-                                    )
-                                    .clicked()
-                                {
-                                    picker.enter(&d);
-                                }
-                            }
-                        });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if primary_button(ui, &palette, "Выбрать эту папку").clicked()
-                        {
-                            chosen = Some(picker.path.clone());
-                            close = true;
-                        }
-                        if ui.button("Отмена").clicked() {
-                            close = true;
-                        }
-                    });
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let mut close = false;
+        let mut chosen: Option<PathBuf> = None;
+        egui::Window::new("Выбор папки")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([560.0, 420.0])
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Вверх").clicked() {
+                        picker.go_to_parent();
+                    }
+                    ui.label(small(&palette, picker.path.display().to_string()));
                 });
-            if let Some(path) = chosen {
-                match self.picker.as_ref().map(|p| p.for_what) {
-                    Some(PickFor::Container) => self.container_dir = path.display().to_string(),
-                    Some(PickFor::Dump) => self.dump_dir = path.display().to_string(),
-                    None => {}
-                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for d in picker.dirs.clone() {
+                            let button = egui::Button::new(&d)
+                                .fill(egui::Color32::TRANSPARENT)
+                                .frame(false);
+                            if ui.add_sized([ui.available_width(), 28.0], button).clicked() {
+                                picker.enter(&d);
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if primary_button(ui, &palette, "Выбрать эту папку").clicked() {
+                        chosen = Some(picker.path.clone());
+                        close = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(path) = chosen {
+            let path = path.display().to_string();
+            match picker.for_what {
+                PickFor::Container => self.container_dir = path,
+                PickFor::Dump => self.dump_dir = path,
             }
-            if close {
-                self.picker = None;
-            }
+        }
+        if close {
+            self.picker = None;
         }
     }
 }

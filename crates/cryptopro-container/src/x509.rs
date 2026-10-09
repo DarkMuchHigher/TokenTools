@@ -332,15 +332,12 @@ fn padded(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hex_lower as hex;
 
     fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut out = vec![tag, content.len() as u8];
         out.extend_from_slice(content);
         out
-    }
-
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[test]

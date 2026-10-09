@@ -1,7 +1,5 @@
-# Cargo build output
 /target/
 
-# Local credentials, key containers and certificate material
 *.key
 *.cer
 *.pem
@@ -9,7 +7,6 @@
 *.pfx
 *.der
 
-# Local tools and reverse-engineering databases
 *.exe
 *.dll
 *.so
@@ -20,12 +17,10 @@
 *.nam
 *.til
 
-# Local runtime data
 *.log
 .cache/
 .env
 
-# Editor and OS files
 .idea/
 .vscode/
 .DS_Store

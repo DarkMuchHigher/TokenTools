@@ -13,47 +13,58 @@ pub const CONTAINER_FILES: [&str; 6] = [
     "primary2.key",
     "masks2.key",
 ];
+pub const CONTAINER_ROLES: [(u8, &str); 6] = [
+    (1, "masks.key"),
+    (2, "primary.key"),
+    (3, "header.key"),
+    (4, "masks2.key"),
+    (5, "primary2.key"),
+    (6, "name.key"),
+];
+
+pub fn file_name_by_role(role: u8) -> Option<&'static str> {
+    CONTAINER_ROLES
+        .iter()
+        .find(|(value, _)| *value == role)
+        .map(|(_, name)| *name)
+}
+
+pub fn container_dir_name(name: Option<&str>, folder: u16) -> String {
+    let sanitized: String = name
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        format!("{folder:04x}")
+    } else {
+        sanitized.to_string()
+    }
+}
+
+pub fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+const CP1251_HIGH: [char; 64] = [
+    'Ђ', 'Ѓ', '‚', 'ѓ', '„', '…', '†', '‡', '€', '‰', 'Љ', '‹', 'Њ', 'Ќ', 'Ћ', 'Џ', 'ђ', '‘', '’',
+    '“', '”', '•', '–', '—', '?', '™', 'љ', '›', 'њ', 'ќ', 'ћ', 'џ', '\u{A0}', 'Ў', 'ў', 'Ј', '¤',
+    'Ґ', '¦', '§', 'Ё', '©', 'Є', '«', '¬', '\u{AD}', '®', 'Ї', '°', '±', 'І', 'і', 'ґ', 'µ', '¶',
+    '·', 'ё', '№', 'є', '»', 'ј', 'Ѕ', 'ѕ', 'ї',
+];
 pub fn cp1251_to_string(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|&b| match b {
-            0xC0..=0xD6 => char::from_u32(0x0410 + (b as u32 - 0xC0)).unwrap_or('?'),
-            0xD8..=0xDF => char::from_u32(0x0428 + (b as u32 - 0xD8)).unwrap_or('?'),
-            0xE0..=0xF6 => char::from_u32(0x0430 + (b as u32 - 0xE0)).unwrap_or('?'),
-            0xF8..=0xFF => char::from_u32(0x0448 + (b as u32 - 0xF8)).unwrap_or('?'),
-            0xA8 => 'Ё',
-            0xB8 => 'ё',
-            0xA1 => 'Ў',
-            0xA2 => 'ў',
-            0xA3 => 'Ј',
-            0xA5 => 'Ґ',
-            0xA6 => '¦',
-            0xA9 => '©',
-            0xAA => 'Є',
-            0xAB => '«',
-            0xAC => '¬',
-            0xAD => '\u{00AD}',
-            0xAE => '®',
-            0xAF => 'Ї',
-            0xB0 => '°',
-            0xB1 => '±',
-            0xB2 => 'І',
-            0xB3 => 'і',
-            0xB4 => 'ґ',
-            0xB5 => 'µ',
-            0xB6 => '¶',
-            0xB7 => '·',
-            0xB9 => '№',
-            0xBA => 'є',
-            0xBB => '»',
-            0xBC => 'ј',
-            0xBD => 'Ѕ',
-            0xBE => 'ѕ',
-            0xBF => 'ї',
-            0xD7 => '×',
-            0xF7 => '÷',
-            0x20..=0x7E => b as char,
-            b'\t' | b'\n' | b'\r' => b as char,
+            0xC0..=0xFF => char::from_u32(0x0410 + u32::from(b - 0xC0)).unwrap_or('?'),
+            0x80..=0xBF => CP1251_HIGH[usize::from(b - 0x80)],
+            0x20..=0x7E | b'\t' | b'\n' | b'\r' => b as char,
             _ => '?',
         })
         .collect()
@@ -191,8 +202,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cp1251_maps_special_bytes() {
-        assert_eq!(cp1251_to_string(&[0xC0, 0xD7, 0xF7, 0xF8]), "А×÷ш");
+    fn container_dir_name_prefers_container_name() {
+        assert_eq!(
+            container_dir_name(Some("d7c17f03-4cc5-41f1-a847-42f21306db7a"), 0x0A00),
+            "d7c17f03-4cc5-41f1-a847-42f21306db7a"
+        );
+        assert_eq!(
+            container_dir_name(Some("ООО \"Ромашка\"/тест"), 0x0A00),
+            "ООО \"Ромашка\"_тест"
+        );
+        assert_eq!(container_dir_name(None, 0x0B00), "0b00");
+        assert_eq!(container_dir_name(Some("   "), 0x0C00), "0c00");
+    }
+
+    #[test]
+    fn roles_match_container_files() {
+        let mut from_roles: Vec<&str> = CONTAINER_ROLES.iter().map(|(_, name)| *name).collect();
+        let mut from_files = CONTAINER_FILES.to_vec();
+        from_roles.sort_unstable();
+        from_files.sort_unstable();
+        assert_eq!(from_roles, from_files);
+        assert_eq!(file_name_by_role(3), Some("header.key"));
+        assert_eq!(file_name_by_role(6), Some("name.key"));
+        assert_eq!(file_name_by_role(7), None);
+    }
+
+    #[test]
+    fn cp1251_decodes_full_cyrillic_alphabet() {
+        let upper: Vec<u8> = (0xC0..=0xDF).collect();
+        let lower: Vec<u8> = (0xE0..=0xFF).collect();
+        assert_eq!(cp1251_to_string(&upper), "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ");
+        assert_eq!(cp1251_to_string(&lower), "абвгдежзийклмнопрстуфхцчшщъыьэюя");
+    }
+
+    #[test]
+    fn cp1251_decodes_punctuation_and_specials() {
+        assert_eq!(
+            cp1251_to_string(&[0xA8, 0xB8, 0xB9, 0xAB, 0xBB, 0x96, 0x97, 0x88, 0x98, 0x41]),
+            "Ёё№«»–—€?A"
+        );
     }
 
     #[test]

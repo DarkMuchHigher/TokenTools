@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, bail};
-use cryptopro_container::{CONTAINER_FILES, build_name_key, cp1251_to_string, is_container_dir};
+use cryptopro_container::{
+    CONTAINER_FILES, build_name_key, cp1251_to_string, is_container_dir, parse_name_key,
+    read_container,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,7 +33,8 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    file.write_all(data)
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 #[cfg(not(unix))]
@@ -40,7 +44,8 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         .write(true)
         .create_new(true)
         .open(path)?;
-    file.write_all(data)
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 pub fn write_private_once(path: &Path, data: &[u8]) -> Result<()> {
@@ -57,13 +62,44 @@ pub fn write_private_once(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn save_container(dest: &Path, folder: &str, files: &[(String, Vec<u8>)]) -> Result<PathBuf> {
+    let out = dest.join(folder);
+    if out.exists() {
+        bail!("{} уже существует; перезапись запрещена", out.display());
+    }
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("не удалось создать {}", dest.display()))?;
+    let partial = dest.join(format!(
+        ".{folder}.partial-{}-{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    create_private_dir(&partial)
+        .with_context(|| format!("не удалось создать {}", partial.display()))?;
+    let result = files
+        .iter()
+        .try_for_each(|(name, data)| {
+            let path = partial.join(name);
+            write_private(&path, data)
+                .with_context(|| format!("не удалось записать {}", path.display()))
+        })
+        .and_then(|()| {
+            std::fs::rename(&partial, &out)
+                .with_context(|| format!("не удалось создать {}", out.display()))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+    result.map(|()| out)
+}
+
 fn contains_success_marker(output: &[u8]) -> bool {
     output
         .windows(7)
         .any(|w| w == b"\xf3\xf1\xef\xe5\xf8\xed\xee")
 }
 
-fn user_home() -> Option<PathBuf> {
+pub fn user_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -172,97 +208,66 @@ fn flatpak_wine_available() -> bool {
         .unwrap_or(false)
 }
 
+fn status(
+    name: &'static str,
+    used_by: &'static str,
+    state: DependencyState,
+    detail: String,
+) -> DependencyStatus {
+    DependencyStatus {
+        name,
+        state,
+        detail,
+        used_by,
+    }
+}
+
+fn status_from_path(
+    name: &'static str,
+    used_by: &'static str,
+    found: Result<PathBuf>,
+) -> DependencyStatus {
+    match found {
+        Ok(path) => status(
+            name,
+            used_by,
+            DependencyState::Ready,
+            path.display().to_string(),
+        ),
+        Err(error) => status(name, used_by, DependencyState::Missing, error.to_string()),
+    }
+}
+
 fn check_pcsc() -> DependencyStatus {
-    match pcsc_transport::Pcsc::load() {
-        Ok(pcsc) => match pcsc.list_readers() {
-            Ok(readers) if readers.is_empty() => DependencyStatus {
-                name: "PC/SC",
-                state: DependencyState::Notice,
-                detail: "библиотека загружена, считыватели не найдены".into(),
-                used_by: "list, dump",
-            },
-            Ok(readers) => DependencyStatus {
-                name: "PC/SC",
-                state: DependencyState::Ready,
-                detail: format!("библиотека загружена, считывателей: {}", readers.len()),
-                used_by: "list, dump",
-            },
-            Err(error) => DependencyStatus {
-                name: "PC/SC",
-                state: DependencyState::Missing,
-                detail: format!("не удалось получить список считывателей: {error}"),
-                used_by: "list, dump",
-            },
-        },
-        Err(error) => DependencyStatus {
-            name: "PC/SC",
-            state: DependencyState::Missing,
-            detail: error.to_string(),
-            used_by: "list, dump",
-        },
+    let pcsc = |state, detail| status("PC/SC", "list, dump", state, detail);
+    match pcsc_transport::Pcsc::load().and_then(|pcsc| pcsc.list_readers()) {
+        Ok(readers) if readers.is_empty() => pcsc(
+            DependencyState::Notice,
+            "библиотека загружена, считыватели не найдены".into(),
+        ),
+        Ok(readers) => pcsc(
+            DependencyState::Ready,
+            format!("библиотека загружена, считывателей: {}", readers.len()),
+        ),
+        Err(error) => pcsc(DependencyState::Missing, error.to_string()),
     }
 }
 
 fn check_wine() -> DependencyStatus {
+    let wine = |state, detail: &str| status("Wine / Flatpak Wine", "fix", state, detail.into());
     if cfg!(target_os = "windows") {
-        return DependencyStatus {
-            name: "Wine / Flatpak Wine",
-            state: DependencyState::Ready,
-            detail: "не требуется на Windows".into(),
-            used_by: "fix",
-        };
+        return wine(DependencyState::Ready, "не требуется на Windows");
     }
-    let wine = command_available("wine");
+    let wine_found = command_available("wine");
     let flatpak = command_available("flatpak") && flatpak_wine_available();
-    let detail = match (wine, flatpak) {
-        (true, true) => "найдены wine и Flatpak Wine".to_string(),
-        (true, false) => "найден wine".to_string(),
-        (false, true) => "найден Flatpak Wine".to_string(),
-        (false, false) => "не найден wine или установленный org.winehq.Wine".to_string(),
-    };
-    DependencyStatus {
-        name: "Wine / Flatpak Wine",
-        state: if wine || flatpak {
-            DependencyState::Ready
-        } else {
-            DependencyState::Missing
-        },
-        detail,
-        used_by: "fix",
-    }
-}
-
-fn check_p12utility() -> DependencyStatus {
-    match find_p12utility() {
-        Ok(path) => DependencyStatus {
-            name: "p12utility.win32.exe",
-            state: DependencyState::Ready,
-            detail: path.display().to_string(),
-            used_by: "fix",
-        },
-        Err(error) => DependencyStatus {
-            name: "p12utility.win32.exe",
-            state: DependencyState::Missing,
-            detail: error.to_string(),
-            used_by: "fix",
-        },
-    }
-}
-
-fn check_csp_tool(name: &'static str, used_by: &'static str) -> DependencyStatus {
-    match find_csp_tool(name) {
-        Ok(path) => DependencyStatus {
-            name,
-            state: DependencyState::Ready,
-            detail: path.display().to_string(),
-            used_by,
-        },
-        Err(error) => DependencyStatus {
-            name,
-            state: DependencyState::Missing,
-            detail: error.to_string(),
-            used_by,
-        },
+    match (wine_found, flatpak) {
+        (true, true) => wine(DependencyState::Ready, "найдены wine и Flatpak Wine"),
+        (true, false) => wine(DependencyState::Ready, "найден wine"),
+        (false, true) => wine(DependencyState::Ready, "найден Flatpak Wine"),
+        (false, false) => wine(
+            DependencyState::Missing,
+            "не найден wine или установленный org.winehq.Wine",
+        ),
     }
 }
 
@@ -270,9 +275,9 @@ pub fn check_dependencies() -> Vec<DependencyStatus> {
     vec![
         check_pcsc(),
         check_wine(),
-        check_p12utility(),
-        check_csp_tool("csptest", "verify"),
-        check_csp_tool("certmgr", "cert --install"),
+        status_from_path("p12utility.win32.exe", "fix", find_p12utility()),
+        status_from_path("csptest", "verify", find_csp_tool("csptest")),
+        status_from_path("certmgr", "cert --install", find_csp_tool("certmgr")),
     ]
 }
 
@@ -337,7 +342,6 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
     if !cert.is_file() {
         bail!("{}: это не файл сертификата", cert.display());
     }
-    let backup = backup_container(&container_dir)?;
     let exe = sandbox_exe(&find_p12utility()?.canonicalize()?)?;
     let mut cmd;
     if cfg!(target_os = "windows") {
@@ -362,16 +366,16 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
         .arg(&cert)
         .arg("--keyexport")
         .current_dir(&container_dir);
+    let backup = backup_container(&container_dir)?;
     let command_line = describe_command(&cmd);
     let out = cmd.output().context("не удалось запустить p12utility")?;
-    let mut text = format!("$ {command_line}\n");
-    text.push_str(&decode_csp_output(&out.stdout));
-    text.push_str(&decode_csp_output(&out.stderr));
+    let output = command_output(&out);
     let succeeded = out.status.success()
         && (contains_success_marker(&out.stdout)
             || contains_success_marker(&out.stderr)
-            || text.contains("успешно")
-            || text.to_ascii_lowercase().contains("success"));
+            || output.contains("успешно")
+            || output.to_ascii_lowercase().contains("success"));
+    let text = format!("$ {command_line}\n{output}");
     if !succeeded {
         if let Err(error) = restore_container(&container_dir, &backup) {
             bail!(
@@ -385,8 +389,11 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
             text
         );
     }
-    text.push_str(&format!("\nBackup: {}\n", backup.display()));
-    Ok(text)
+    Ok(format!("{text}\nBackup: {}\n", backup.display()))
+}
+
+fn command_output(out: &std::process::Output) -> String {
+    decode_csp_output(&out.stdout) + &decode_csp_output(&out.stderr)
 }
 
 fn describe_command(cmd: &Command) -> String {
@@ -441,6 +448,315 @@ fn verify_name(attempt: u32) -> String {
     format!("t{value:07x}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsbVolume {
+    pub uuid: String,
+    pub mount: PathBuf,
+}
+
+impl UsbVolume {
+    pub fn label(&self) -> String {
+        self.mount
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.uuid.clone())
+    }
+}
+
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = (bytes[i] == b'\\' && i + 4 <= bytes.len())
+            .then(|| std::str::from_utf8(&bytes[i + 1..i + 4]).ok())
+            .flatten()
+            .and_then(|digits| u8::from_str_radix(digits, 8).ok());
+        match octal {
+            Some(byte) => {
+                out.push(byte);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_usb_device(device: &str) -> bool {
+    let Some(name) = Path::new(device).file_name() else {
+        return false;
+    };
+    std::fs::canonicalize(Path::new("/sys/class/block").join(name))
+        .is_ok_and(|path| path.to_string_lossy().contains("/usb"))
+}
+
+fn volume_uuid_of(device: &str) -> Option<String> {
+    let device = std::fs::canonicalize(device).ok()?;
+    std::fs::read_dir("/dev/disk/by-uuid")
+        .ok()?
+        .flatten()
+        .find(|entry| std::fs::canonicalize(entry.path()).ok().as_deref() == Some(device.as_path()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+}
+
+pub fn usb_volumes() -> Vec<UsbVolume> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    let mut volumes: Vec<UsbVolume> = Vec::new();
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(device), Some(mount)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !device.starts_with("/dev/") || !is_usb_device(device) {
+            continue;
+        }
+        let mount = PathBuf::from(unescape_mount_field(mount));
+        if volumes.iter().any(|volume| volume.mount == mount) {
+            continue;
+        }
+        if let Some(uuid) = volume_uuid_of(device) {
+            volumes.push(UsbVolume { uuid, mount });
+        }
+    }
+    volumes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployedContainer {
+    pub name: String,
+    pub dir: PathBuf,
+    pub csp_name: Option<String>,
+}
+
+pub fn link_certificate(container_name: &str) -> Result<String> {
+    let mut cmd = Command::new(find_csp_tool("cryptcp")?);
+    cmd.args(["-cspcert", "-cont"])
+        .arg(container_name)
+        .arg("-du");
+    let command_line = describe_command(&cmd);
+    let out = cmd.output().context("не удалось запустить cryptcp")?;
+    let text = format!("$ {command_line}\n{}", command_output(&out));
+    if !out.status.success() {
+        bail!("cryptcp не подтвердил установку сертификата\n{text}");
+    }
+    Ok(text)
+}
+
+pub fn csp_keys_dir() -> Result<PathBuf> {
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let keys = PathBuf::from("/var/opt/cprocsp/keys").join(user);
+    if !keys.is_dir() {
+        bail!("каталог ключей CSP не найден: {}", keys.display());
+    }
+    Ok(keys)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageContainer {
+    pub name: String,
+    pub dir: PathBuf,
+    pub files: usize,
+    pub volume: Option<String>,
+}
+
+impl StorageContainer {
+    pub fn csp_name(&self) -> String {
+        match &self.volume {
+            Some(uuid) => format!("\\\\.\\{uuid}\\{}", self.name),
+            None => format!("\\\\.\\HDIMAGE\\{}", self.name),
+        }
+    }
+
+    pub fn container_name(&self) -> Option<String> {
+        std::fs::read(self.dir.join("name.key"))
+            .ok()
+            .and_then(|data| parse_name_key(&data))
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.files == CONTAINER_FILES.len()
+    }
+}
+
+fn storage_name(name: &str) -> Result<String> {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '/' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        bail!("некорректное имя контейнера: {name}");
+    }
+    Ok(sanitized.to_string())
+}
+
+fn storage_dir(name: &str) -> Result<PathBuf> {
+    Ok(csp_keys_dir()?.join(format!("{}.000", storage_name(name)?)))
+}
+
+enum Target {
+    Store,
+    Flash(String),
+    Folder,
+}
+
+fn resolve_target(dest: &Path) -> Result<Target> {
+    if csp_keys_dir().is_ok_and(|keys| keys.canonicalize().ok().as_deref() == Some(dest)) {
+        return Ok(Target::Store);
+    }
+    for volume in usb_volumes() {
+        let Ok(mount) = volume.mount.canonicalize() else {
+            continue;
+        };
+        if mount == dest {
+            return Ok(Target::Flash(volume.uuid));
+        }
+        if dest.starts_with(&mount) {
+            bail!(
+                "КриптоПро ищет контейнеры только в корне флешки: {}",
+                mount.display()
+            );
+        }
+    }
+    Ok(Target::Folder)
+}
+
+pub fn deploy_container(src: &Path, dest: &Path, name: Option<&str>) -> Result<DeployedContainer> {
+    if !is_container_dir(src) {
+        bail!("{}: неполный контейнер, нужны все 6 файлов", src.display());
+    }
+    let own_name = read_container(src)?
+        .0
+        .context("в name.key нет имени контейнера")?;
+    let name = storage_name(name.unwrap_or(&own_name))?;
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("не удалось создать {}", dest.display()))?;
+    let canonical = dest.canonicalize()?;
+    let target = resolve_target(&canonical)?;
+    let dir = canonical.join(format!("{name}.000"));
+    if dir.exists() {
+        bail!("{} уже существует", dir.display());
+    }
+    create_private_dir(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
+    let result = copy_container(src, &dir).and_then(|()| {
+        if name == own_name {
+            return Ok(());
+        }
+        std::fs::write(dir.join("name.key"), build_name_key(name.as_bytes()))
+            .with_context(|| format!("не удалось переименовать контейнер в {name}"))
+    });
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    for path in [&dir, &canonical] {
+        let _ = std::fs::File::open(path).and_then(|handle| handle.sync_all());
+    }
+    let csp_name = match target {
+        Target::Store => Some(format!("\\\\.\\HDIMAGE\\{name}")),
+        Target::Flash(uuid) => Some(format!("\\\\.\\{uuid}\\{name}")),
+        Target::Folder => None,
+    };
+    Ok(DeployedContainer {
+        name,
+        dir,
+        csp_name,
+    })
+}
+
+pub fn remove_container(dir: &Path) -> Result<()> {
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("{} не найден", dir.display()))?;
+    if !dir.to_string_lossy().ends_with(".000") || !is_container_dir(&dir) {
+        bail!(
+            "{}: не похоже на контейнер, удаление отменено",
+            dir.display()
+        );
+    }
+    let parent = dir
+        .parent()
+        .context("у контейнера нет родительского каталога")?;
+    let known = csp_keys_dir()
+        .ok()
+        .into_iter()
+        .chain(usb_volumes().into_iter().map(|volume| volume.mount))
+        .any(|root| root.canonicalize().ok().as_deref() == Some(parent));
+    if !known {
+        bail!(
+            "{}: контейнер лежит не в хранилище CSP и не на флешке, удаление отменено",
+            dir.display()
+        );
+    }
+    std::fs::remove_dir_all(&dir).with_context(|| format!("не удалось удалить {}", dir.display()))
+}
+
+pub fn unmount_container(name: &str) -> Result<PathBuf> {
+    let dir = storage_dir(name)?;
+    remove_container(&dir)?;
+    Ok(dir)
+}
+
+fn scan_containers(root: &Path, volume: Option<&str>, out: &mut Vec<StorageContainer>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = file_name.strip_suffix(".000") else {
+            continue;
+        };
+        if !dir.is_dir() {
+            continue;
+        }
+        out.push(StorageContainer {
+            name: name.to_string(),
+            files: CONTAINER_FILES
+                .iter()
+                .filter(|file| dir.join(file).is_file())
+                .count(),
+            dir,
+            volume: volume.map(str::to_string),
+        });
+    }
+}
+
+pub fn storage_containers() -> Vec<StorageContainer> {
+    let mut out = Vec::new();
+    if let Ok(keys) = csp_keys_dir() {
+        scan_containers(&keys, None, &mut out);
+    }
+    for volume in usb_volumes() {
+        scan_containers(&volume.mount, Some(&volume.uuid), &mut out);
+    }
+    out.sort_by(|a, b| (&a.volume, &a.name).cmp(&(&b.volume, &b.name)));
+    out
+}
+
+fn unique_storage_name() -> Result<String> {
+    for attempt in 0..100 {
+        let name = verify_name(attempt);
+        if !storage_dir(&name)?.exists() {
+            return Ok(name);
+        }
+    }
+    bail!("не удалось подобрать уникальное имя временного CSP-контейнера")
+}
+
 pub fn verify_container(container_dir: &Path) -> Result<String> {
     let container_dir = container_dir
         .canonicalize()
@@ -457,55 +773,29 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
             .arg(&container_dir);
         let command_line = describe_command(&cmd);
         let out = cmd.output().context("не удалось запустить csptest")?;
-        let mut text = format!("$ {command_line}\n");
-        text.push_str(&decode_csp_output(&out.stdout));
-        text.push_str(&decode_csp_output(&out.stderr));
+        let text = format!("$ {command_line}\n{}", command_output(&out));
         if !out.status.success() {
             bail!("csptest завершился с ошибкой\n{text}");
         }
         return Ok(text);
     }
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
-    let keys = PathBuf::from("/var/opt/cprocsp/keys").join(&user);
-    if !keys.is_dir() {
-        bail!("каталог ключей CSP не найден: {}", keys.display());
-    }
-    let mut tmp = None;
-    for attempt in 0..100 {
-        let name = verify_name(attempt);
-        let path = keys.join(format!("{name}.000"));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                tmp = Some((name, path));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).context("не удалось создать временный CSP-контейнер"),
-        }
-    }
-    let Some((name, tmp)) = tmp else {
-        bail!("не удалось подобрать уникальное имя временного CSP-контейнера");
-    };
-    let mut cmd = Command::new(find_csp_tool("csptest")?);
-    cmd.args(["-keyset", "-check", "-container"])
-        .arg(format!("\\\\.\\hdimage\\{name}"));
+    let csptest = find_csp_tool("csptest")?;
+    let name = unique_storage_name()?;
+    let deployed = deploy_container(&container_dir, &csp_keys_dir()?, Some(&name))?;
+    let csp_name = deployed
+        .csp_name
+        .clone()
+        .context("временный контейнер не попал в хранилище CSP")?;
+    let mut cmd = Command::new(csptest);
+    cmd.args(["-keyset", "-check", "-container"]).arg(csp_name);
     let command_line = describe_command(&cmd);
-    let result = (|| -> Result<std::process::Output> {
-        copy_container(&container_dir, &tmp)?;
-        std::fs::write(tmp.join("name.key"), build_name_key(name.as_bytes()))?;
-        cmd.output().context("не удалось запустить csptest")
-    })();
-    let cleanup = std::fs::remove_dir_all(&tmp);
+    let result = cmd.output().context("не удалось запустить csptest");
+    let cleanup = remove_container(&deployed.dir);
     let out = result?;
     if let Err(error) = cleanup {
-        bail!(
-            "не удалось удалить временный CSP-контейнер {}: {error}",
-            tmp.display()
-        );
+        bail!("не удалось удалить временный CSP-контейнер: {error}");
     }
-    let mut text = format!("$ {command_line}\n");
-    text.push_str(&decode_csp_output(&out.stdout));
-    text.push_str(&decode_csp_output(&out.stderr));
+    let text = format!("$ {command_line}\n{}", command_output(&out));
     if !out.status.success() {
         bail!("csptest завершился с ошибкой\n{text}");
     }
@@ -525,9 +815,7 @@ pub fn certmgr_install(
     cmd.args(["-store", store]);
     let command_line = describe_command(&cmd);
     let output = cmd.output().context("не удалось запустить certmgr")?;
-    let mut text = format!("$ {command_line}\n");
-    text.push_str(&decode_csp_output(&output.stdout));
-    text.push_str(&decode_csp_output(&output.stderr));
+    let text = format!("$ {command_line}\n{}", command_output(&output));
     Ok((text, output.status.success()))
 }
 
@@ -676,6 +964,21 @@ mod tests {
     }
 
     #[test]
+    fn save_container_is_atomic_and_never_overwrites() {
+        let base = std::env::temp_dir().join(format!("tokentools-save-{}", now_nanos()));
+        let files = vec![("name.key".to_string(), b"a".to_vec())];
+        let out = save_container(&base, "2560-0001", &files).expect("first save");
+        assert_eq!(std::fs::read(out.join("name.key")).expect("saved"), b"a");
+        assert!(save_container(&base, "2560-0001", &files).is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(&base)
+            .expect("dest dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(leftovers, ["2560-0001"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn write_private_once_keeps_existing_different_file() {
         let path = std::env::temp_dir().join(format!("tokentools-once-{}", now_nanos()));
         write_private_once(&path, b"first").expect("first write");
@@ -683,6 +986,38 @@ mod tests {
         assert!(write_private_once(&path, b"second").is_err());
         assert_eq!(std::fs::read(&path).expect("file readable"), b"first");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unescapes_proc_mounts_fields() {
+        assert_eq!(
+            unescape_mount_field("/run/media/dark/My\\040Flash"),
+            "/run/media/dark/My Flash"
+        );
+        assert_eq!(unescape_mount_field("/mnt/a\\134b"), "/mnt/a\\b");
+        assert_eq!(unescape_mount_field("/mnt/plain\\"), "/mnt/plain\\");
+    }
+
+    #[test]
+    fn deploy_and_remove_roundtrip_in_plain_folder() {
+        let base = std::env::temp_dir().join(format!("tokentools-deploy-{}", now_nanos()));
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        for file in CONTAINER_FILES {
+            std::fs::write(src.join(file), b"x").expect("file");
+        }
+        std::fs::write(src.join("name.key"), build_name_key(b"orig")).expect("name.key");
+        let dest = base.join("dest");
+        let deployed = deploy_container(&src, &dest, Some("copy")).expect("deploy");
+        assert_eq!(deployed.csp_name, None);
+        assert_eq!(deployed.name, "copy");
+        assert_eq!(
+            parse_name_key(&std::fs::read(deployed.dir.join("name.key")).expect("name.key")),
+            Some("copy".to_string())
+        );
+        assert!(deploy_container(&src, &dest, Some("copy")).is_err());
+        assert!(remove_container(&deployed.dir).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use cryptopro_container::hex_lower;
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "\
@@ -13,6 +14,10 @@ TokenTools: выгрузка контейнеров с токена (Tokens) + �
   fix <DIR>            Снять флаг неэкспортируемости [--cert CERT]
   verify <DIR>         Проверка контейнера через CryptoPro CSP
   cert <DIR>           Извлечение сертификатов [--install] [--show] [--pem]
+  storage              Контейнеры в хранилище CSP и на флешках
+  deploy <DIR> [DEST]  Установить контейнер в хранилище CSP или в корень флешки
+                       [--name ИМЯ] [--link]
+  unmount <ИМЯ>        Удалить контейнер из хранилища CSP
 
 Опции:
   -v, --verbose        Подробный вывод
@@ -39,6 +44,16 @@ enum Cmd {
         install: bool,
         show: bool,
         pem: bool,
+    },
+    Storage,
+    Unmount {
+        name: String,
+    },
+    Deploy {
+        dir: PathBuf,
+        dest: Option<PathBuf>,
+        name: Option<String>,
+        link: bool,
     },
 }
 
@@ -204,6 +219,59 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 pem,
             }
         }
+        "storage" => {
+            reject_extra_args(&mut parser, "storage")?;
+            Cmd::Storage
+        }
+        "unmount" => {
+            let mut name = None;
+            while let Some(arg) = parser.next() {
+                match arg {
+                    "-v" | "--verbose" => parser.verbose = true,
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("unmount: неизвестная опция: {arg}"));
+                    }
+                    _ => set_once(&mut name, arg, "unmount: лишний аргумент")?,
+                }
+            }
+            let name = name.ok_or("unmount: не указано имя: unmount <ИМЯ>")?;
+            Cmd::Unmount {
+                name: name.to_string(),
+            }
+        }
+        "deploy" => {
+            let mut dir = None;
+            let mut dest = None;
+            let mut name = None;
+            let mut link = false;
+            while let Some(arg) = parser.next() {
+                match arg {
+                    "-v" | "--verbose" => parser.verbose = true,
+                    "--link" => link = true,
+                    "--name" => name = Some(parser.value_for("--name")?.to_string()),
+                    _ if arg.starts_with("--name=") => {
+                        name = Some(arg["--name=".len()..].to_string());
+                    }
+                    _ if arg.starts_with('-') => {
+                        return Err(format!("deploy: неизвестная опция: {arg}"));
+                    }
+                    _ => {
+                        if dir.is_none() {
+                            dir = Some(arg);
+                        } else {
+                            set_once(&mut dest, arg, "deploy: лишний аргумент")?;
+                        }
+                    }
+                }
+            }
+            let dir = dir.ok_or("deploy: не указан каталог контейнера: deploy <DIR> [DEST]")?;
+            Cmd::Deploy {
+                dir: PathBuf::from(dir),
+                dest: dest.map(PathBuf::from),
+                name,
+                link,
+            }
+        }
         other => return Err(format!("неизвестная команда: {other}")),
     };
     Ok(Parsed::Run {
@@ -247,8 +315,17 @@ fn run(verbose: bool, cmd: Cmd) -> Result<()> {
             show,
             pem,
         } => cmd_cert(&dir, install, show, pem),
+        Cmd::Storage => cmd_storage(),
+        Cmd::Unmount { name } => cmd_unmount(&name),
+        Cmd::Deploy {
+            dir,
+            dest,
+            name,
+            link,
+        } => cmd_deploy(&dir, dest.as_deref(), name.as_deref(), link),
     }
 }
+
 fn cmd_doctor() -> Result<()> {
     let checks = certfix::check_dependencies();
     println!("Проверка окружения TokenTools:");
@@ -303,7 +380,6 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
         bail!("считыватели PC/SC не найдены — подключите токен");
     }
     let (pin, pin_source) = resolve_pin(pin, std::env::var("TOKENTOOLS_PIN").ok())?;
-    std::fs::create_dir_all(dest)?;
     for reader in &readers {
         println!("Считыватель: {reader}");
         let card = match pcsc.connect(reader) {
@@ -329,82 +405,45 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
                 continue;
             }
         }
-        println!("  выбираю MF (3F00)...");
-        let (_, sw) = fs.select_mf()?;
-        if sw != 0x9000 {
-            println!("  MF недоступен (SW={sw:04x}) — пропускаю");
-            continue;
-        }
-        let trees = match fs.walk(6) {
-            Ok(t) => t,
+        let containers = match fs.containers() {
+            Ok(c) => c,
             Err(e) => {
-                println!("  ошибка обхода ФС: {e}");
+                println!("  ошибка поиска контейнеров: {e}");
                 continue;
             }
         };
-        for (path, files) in trees {
-            let pathstr = if path.is_empty() {
-                "root".to_string()
-            } else {
-                path.iter()
-                    .map(|f| format!("{f:04x}"))
-                    .collect::<Vec<_>>()
-                    .join("-")
+        if containers.is_empty() {
+            println!("  контейнеры не найдены");
+            continue;
+        }
+        for container in containers {
+            let folder = container.folder;
+            let files = match fs.read_container(&container) {
+                Ok(files) => files,
+                Err(e) => {
+                    println!("  контейнер {folder:04x} пропущен: {e}");
+                    continue;
+                }
             };
-            if files.len() == 6 {
-                let mut container_files = Vec::with_capacity(files.len());
-                let mut ok = true;
-                for (fname, entry) in rutoken_fs::CONTAINER_FILES.iter().zip(files.iter()) {
-                    match fs.read_file(entry.fid, entry.size) {
-                        Ok(blob) => container_files.push(((*fname).to_string(), blob)),
-                        Err(e) => {
-                            println!("    ошибка чтения {fname}: {e}");
-                            ok = false;
-                        }
-                    }
-                }
-                if !ok {
-                    println!("  контейнер /{pathstr}/ пропущен: не удалось прочитать все файлы");
-                    continue;
-                }
-                let out = dest.join(&pathstr);
-                let partial = dest.join(format!(
-                    ".{pathstr}.partial-{}-{}",
-                    std::process::id(),
-                    certfix::now_nanos()
-                ));
-                certfix::create_private_dir(&partial)?;
-                for (fname, blob) in &container_files {
-                    if let Err(error) = certfix::write_private(&partial.join(fname), blob) {
-                        let _ = std::fs::remove_dir_all(&partial);
-                        return Err(error.into());
-                    }
-                }
-                if out.exists() {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    println!(
-                        "  контейнер /{pathstr}/ пропущен: {} уже существует",
-                        out.display()
-                    );
-                    continue;
-                }
-                let name = std::fs::read(partial.join("name.key"))
-                    .ok()
-                    .and_then(|d| cryptopro_container::parse_name_key(&d))
-                    .unwrap_or_default();
-                if let Err(error) = std::fs::rename(&partial, &out) {
-                    let _ = std::fs::remove_dir_all(&partial);
-                    return Err(error.into());
-                }
-                println!(
-                    "  контейнер /{pathstr}/ -> {}  [OK]  имя: {name}",
-                    out.display()
-                );
-            } else {
-                println!(
-                    "  папка /{pathstr}/: {} файл(ов) — не контейнер",
-                    files.len()
-                );
+            let files: Vec<(String, Vec<u8>)> = files
+                .into_iter()
+                .filter_map(|(role, data)| {
+                    cryptopro_container::file_name_by_role(role)
+                        .map(|name| (name.to_string(), data))
+                })
+                .collect();
+            let name = files
+                .iter()
+                .find(|(name, _)| name == "name.key")
+                .and_then(|(_, data)| cryptopro_container::parse_name_key(data));
+            let dir = cryptopro_container::container_dir_name(name.as_deref(), folder);
+            match certfix::save_container(dest, &dir, &files) {
+                Ok(out) => println!(
+                    "  контейнер {folder:04x} -> {}  [OK]  имя: {}",
+                    out.display(),
+                    name.as_deref().unwrap_or("(нет)")
+                ),
+                Err(e) => println!("  контейнер {folder:04x} пропущен: {e}"),
             }
         }
     }
@@ -517,6 +556,59 @@ fn cmd_cert(dir: &Path, install: bool, show: bool, pem: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_storage() -> Result<()> {
+    let containers = certfix::storage_containers();
+    if containers.is_empty() {
+        println!("Контейнеров нет. Установка: tokentools deploy <папка контейнера>");
+        return Ok(());
+    }
+    for container in &containers {
+        let name = container
+            .container_name()
+            .unwrap_or_else(|| container.name.clone());
+        let state = if container.is_complete() {
+            "полный"
+        } else {
+            "неполный"
+        };
+        println!(
+            "  {} — {name} ({}/6 файлов, {state})",
+            container.csp_name(),
+            container.files
+        );
+    }
+    Ok(())
+}
+
+fn cmd_unmount(name: &str) -> Result<()> {
+    let dir = certfix::unmount_container(name)?;
+    println!("Удалён: {}", dir.display());
+    Ok(())
+}
+
+fn cmd_deploy(dir: &Path, dest: Option<&Path>, name: Option<&str>, link: bool) -> Result<()> {
+    let dir = dir.canonicalize().context("каталог контейнера не найден")?;
+    let dest = match dest {
+        Some(dest) => dest.to_path_buf(),
+        None => certfix::csp_keys_dir()?,
+    };
+    let deployed = certfix::deploy_container(&dir, &dest, name)?;
+    println!("Установлен: {}", deployed.dir.display());
+    let Some(csp_name) = deployed.csp_name else {
+        println!("Каталог не является хранилищем CSP или корнем флешки: КриптоПро его не увидит");
+        return Ok(());
+    };
+    println!("КриптоПро видит контейнер как {csp_name}");
+    if link {
+        let out = certfix::link_certificate(&csp_name)?;
+        for line in out.lines().filter(|line| !line.trim().is_empty()) {
+            println!("  {}", line.trim_end());
+        }
+        println!("Сертификат скопирован в хранилище uMy со ссылкой на ключ");
+    }
+    Ok(())
+}
+
 fn print_cert_info(label: &str, path: &Path) {
     let der = match std::fs::read(path) {
         Ok(der) => der,
@@ -543,10 +635,6 @@ fn print_cert_info(label: &str, path: &Path) {
         }
         Err(error) => println!("{label}: {}: {error}", path.display()),
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
