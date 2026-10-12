@@ -7,17 +7,23 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
 
 jobs:
   checks:
     name: Checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +57,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -65,6 +71,37 @@ jobs:
       - name: Build release binaries
         run: cargo build --workspace --release --locked
 
+      - name: Smoke test binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          "./target/release/tokentools$exe" --version
+          "./target/release/tokentools$exe" --help > /dev/null
+
+      - name: Install cargo-bundle-licenses
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSLo "$RUNNER_TEMP/cargo-bundle-licenses" \
+            https://github.com/sstadick/cargo-bundle-licenses/releases/download/v4.2.0/cargo-bundle-licenses-linux-amd64
+          chmod +x "$RUNNER_TEMP/cargo-bundle-licenses"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Collect third-party licenses
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo-bundle-licenses --format yaml --output THIRDPARTY.yml
+
+      - name: Upload third-party licenses
+        if: startsWith(matrix.os, 'ubuntu')
+        uses: actions/upload-artifact@v7
+        with:
+          name: thirdparty
+          path: THIRDPARTY.yml
+          retention-days: 14
+
       - name: Report runtime dependencies
         run: cargo run --release -p tokentools -- doctor
 
@@ -73,6 +110,7 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: checks
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +146,12 @@ jobs:
         uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Download third-party licenses
+        uses: actions/download-artifact@v8
+        with:
+          name: thirdparty
 
       - name: Build release binaries
         run: cargo build --workspace --release --locked
@@ -120,7 +163,7 @@ jobs:
           set -euo pipefail
           dir="dist/TokenTools-${{ matrix.artifact }}"
           mkdir -p "$dir"
-          cp target/release/tokentools target/release/tokentools-gui README.md LICENSE "$dir/"
+          cp target/release/tokentools target/release/tokentools-gui README.md LICENSE THIRDPARTY.yml "$dir/"
           cp packaging/tokentools.desktop "$dir/"
           cp assets/app-icon.png "$dir/tokentools.png"
           tar -czf "dist/TokenTools-${{ matrix.artifact }}.tar.gz" \
@@ -133,7 +176,7 @@ jobs:
         run: |
           $dir = "dist/TokenTools-${{ matrix.artifact }}"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item target/release/tokentools.exe, target/release/tokentools-gui.exe, README.md, LICENSE $dir
+          Copy-Item target/release/tokentools.exe, target/release/tokentools-gui.exe, README.md, LICENSE, THIRDPARTY.yml $dir
           Compress-Archive -Path "$dir/*" -DestinationPath "dist/TokenTools-${{ matrix.artifact }}.zip"
           Remove-Item -Recurse -Force $dir
 
@@ -150,6 +193,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: package
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -158,6 +202,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      - name: Write checksums
+        run: |
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create GitHub release
         env:

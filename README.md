@@ -290,16 +290,28 @@ cargo build --workspace --release --locked
 
 ## CI
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) проверяет форматирование, Clippy, тесты и release-сборку на Ubuntu и Windows.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) на каждый push и pull request проверяет
+форматирование, Clippy, тесты и release-сборку на Ubuntu и Windows, затем запускает собранные
+бинарники (`tokentools --version` и `--help`) и печатает `doctor`. Устаревшие запуски на той же
+ветке отменяются, у каждого job есть предел времени.
 
-Для обычных push создаются:
+Для обычных push собираются архивы:
 
 ```text
 TokenTools-linux-x86_64.tar.gz
 TokenTools-windows-x86_64.zip
 ```
 
-Тег вида `vX.Y.Z` публикует оба архива как GitHub Release.
+Тег вида `vX.Y.Z` публикует оба архива как GitHub Release вместе с `SHA256SUMS`.
+
+В архивах лежат `README.md`, `LICENSE` и `THIRDPARTY.yml` — лицензии всех зависимостей, собранные
+`cargo-bundle-licenses`.
+
+[`.github/workflows/security.yml`](.github/workflows/security.yml) сверяет зависимости с базой
+RustSec и прогоняет `cargo-deny` по [`deny.toml`](deny.toml) (уязвимости, лицензии, источники
+пакетов): на изменения `Cargo.toml` и `Cargo.lock`, на pull request и раз в неделю. Уязвимость
+красит чек, а при запуске по расписанию открывается issue. В `deny.toml` дубли версий разрешены:
+они приходят из дерева eframe и своими силами не устраняются.
 
 ## Лицензия
 
