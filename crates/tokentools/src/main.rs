@@ -15,6 +15,7 @@ TokenTools: выгрузка контейнеров с токена (Tokens) + �
   verify <DIR>         Проверка контейнера через CryptoPro CSP
   cert <DIR>           Извлечение сертификатов [--install] [--show] [--pem]
   storage              Контейнеры в хранилище CSP и на флешках
+  repair               Переименовать каталоги контейнеров, которые CSP не видит
   deploy <DIR> [DEST]  Установить контейнер в хранилище CSP или в корень флешки
                        [--name ИМЯ] [--link]
   unmount <ИМЯ>        Удалить контейнер из хранилища CSP
@@ -46,6 +47,7 @@ enum Cmd {
         pem: bool,
     },
     Storage,
+    Repair,
     Unmount {
         name: String,
     },
@@ -223,6 +225,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             reject_extra_args(&mut parser, "storage")?;
             Cmd::Storage
         }
+        "repair" => {
+            reject_extra_args(&mut parser, "repair")?;
+            Cmd::Repair
+        }
         "unmount" => {
             let mut name = None;
             while let Some(arg) = parser.next() {
@@ -316,6 +322,7 @@ fn run(verbose: bool, cmd: Cmd) -> Result<()> {
             pem,
         } => cmd_cert(&dir, install, show, pem),
         Cmd::Storage => cmd_storage(),
+        Cmd::Repair => cmd_repair(),
         Cmd::Unmount { name } => cmd_unmount(&name),
         Cmd::Deploy {
             dir,
@@ -580,6 +587,19 @@ fn cmd_storage() -> Result<()> {
     Ok(())
 }
 
+fn cmd_repair() -> Result<()> {
+    let renamed = certfix::repair_storage()?;
+    if renamed.is_empty() {
+        println!("Каталоги контейнеров в порядке — чинить нечего");
+        return Ok(());
+    }
+    for (from, to) in &renamed {
+        println!("{} -> {}", from.display(), to.display());
+    }
+    println!("Переименовано каталогов: {}", renamed.len());
+    Ok(())
+}
+
 fn cmd_unmount(name: &str) -> Result<()> {
     let dir = certfix::unmount_container(name)?;
     println!("Удалён: {}", dir.display());
@@ -600,7 +620,7 @@ fn cmd_deploy(dir: &Path, dest: Option<&Path>, name: Option<&str>, link: bool) -
     };
     println!("КриптоПро видит контейнер как {csp_name}");
     if link {
-        let out = certfix::link_certificate(&csp_name)?;
+        let out = certfix::link_certificate(&deployed.dir, &csp_name)?;
         for line in out.lines().filter(|line| !line.trim().is_empty()) {
             println!("  {}", line.trim_end());
         }

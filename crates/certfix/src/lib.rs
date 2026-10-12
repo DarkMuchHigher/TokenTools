@@ -534,18 +534,18 @@ pub struct DeployedContainer {
     pub csp_name: Option<String>,
 }
 
-pub fn link_certificate(container_name: &str) -> Result<String> {
-    let mut cmd = Command::new(find_csp_tool("cryptcp")?);
-    cmd.args(["-cspcert", "-cont"])
-        .arg(container_name)
-        .arg("-du");
-    let command_line = describe_command(&cmd);
-    let out = cmd.output().context("не удалось запустить cryptcp")?;
-    let text = format!("$ {command_line}\n{}", command_output(&out));
-    if !out.status.success() {
-        bail!("cryptcp не подтвердил установку сертификата\n{text}");
+pub fn link_certificate(container_dir: &Path, csp_name: &str) -> Result<String> {
+    let (_, certs) = cryptopro_container::read_container(container_dir)?;
+    if certs.owner.is_empty() {
+        bail!("в header.key не найден сертификат владельца");
     }
-    Ok(text)
+    let cert = container_dir.join("cert_exchange.cer");
+    write_private_once(&cert, &certs.owner)?;
+    let (out, ok) = certmgr_install(&cert, Some(csp_name), "uMy")?;
+    if !ok {
+        bail!("certmgr не установил сертификат\n{out}");
+    }
+    Ok(out)
 }
 
 pub fn csp_keys_dir() -> Result<PathBuf> {
@@ -567,9 +567,10 @@ pub struct StorageContainer {
 
 impl StorageContainer {
     pub fn csp_name(&self) -> String {
+        let name = self.container_name().unwrap_or_else(|| self.name.clone());
         match &self.volume {
-            Some(uuid) => format!("\\\\.\\{uuid}\\{}", self.name),
-            None => format!("\\\\.\\HDIMAGE\\{}", self.name),
+            Some(uuid) => format!("\\\\.\\{uuid}\\{name}"),
+            None => format!("\\\\.\\HDIMAGE\\{name}"),
         }
     }
 
@@ -606,6 +607,51 @@ fn storage_dir(name: &str) -> Result<PathBuf> {
     Ok(csp_keys_dir()?.join(format!("{}.000", storage_name(name)?)))
 }
 
+const SHORT_DIR_MAX: usize = 8;
+
+fn needs_short_dir(name: &str) -> bool {
+    name.len() > SHORT_DIR_MAX || !name.is_ascii()
+}
+
+fn short_dir_name(dest: &Path, name: &str) -> Result<String> {
+    if !needs_short_dir(name) {
+        return Ok(name.to_string());
+    }
+    for attempt in 0..100 {
+        let candidate = verify_name(attempt);
+        if !dest.join(format!("{candidate}.000")).exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("не удалось подобрать короткое имя каталога для {name}")
+}
+
+fn repair_dir(keys: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut renamed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(keys) else {
+        return Ok(renamed);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(base) = file_name.strip_suffix(".000") else {
+            continue;
+        };
+        if !dir.is_dir() || !needs_short_dir(base) || !is_container_dir(&dir) {
+            continue;
+        }
+        let target = keys.join(format!("{}.000", short_dir_name(keys, base)?));
+        std::fs::rename(&dir, &target)
+            .with_context(|| format!("не удалось переименовать {}", dir.display()))?;
+        renamed.push((dir, target));
+    }
+    Ok(renamed)
+}
+
+pub fn repair_storage() -> Result<Vec<(PathBuf, PathBuf)>> {
+    repair_dir(&csp_keys_dir()?)
+}
+
 enum Target {
     Store,
     Flash(String),
@@ -637,21 +683,26 @@ pub fn deploy_container(src: &Path, dest: &Path, name: Option<&str>) -> Result<D
     if !is_container_dir(src) {
         bail!("{}: неполный контейнер, нужны все 6 файлов", src.display());
     }
-    let own_name = read_container(src)?
-        .0
-        .context("в name.key нет имени контейнера")?;
-    let name = storage_name(name.unwrap_or(&own_name))?;
+    let own_name = read_container(src)?.0;
+    let name = match name {
+        Some(name) => storage_name(name)?,
+        None => storage_name(
+            own_name
+                .as_deref()
+                .context("в name.key нет имени контейнера: задайте имя")?,
+        )?,
+    };
     std::fs::create_dir_all(dest)
         .with_context(|| format!("не удалось создать {}", dest.display()))?;
     let canonical = dest.canonicalize()?;
     let target = resolve_target(&canonical)?;
-    let dir = canonical.join(format!("{name}.000"));
+    let dir = canonical.join(format!("{}.000", short_dir_name(&canonical, &name)?));
     if dir.exists() {
         bail!("{} уже существует", dir.display());
     }
     create_private_dir(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
     let result = copy_container(src, &dir).and_then(|()| {
-        if name == own_name {
+        if own_name.as_deref() == Some(name.as_str()) {
             return Ok(());
         }
         std::fs::write(dir.join("name.key"), build_name_key(name.as_bytes()))
@@ -706,6 +757,14 @@ pub fn remove_container(dir: &Path) -> Result<()> {
 
 pub fn unmount_container(name: &str) -> Result<PathBuf> {
     let dir = storage_dir(name)?;
+    if !dir.is_dir()
+        && let Some(found) = storage_containers()
+            .into_iter()
+            .find(|c| c.volume.is_none() && c.container_name().as_deref() == Some(name))
+    {
+        remove_container(&found.dir)?;
+        return Ok(found.dir);
+    }
     remove_container(&dir)?;
     Ok(dir)
 }
@@ -1018,6 +1077,101 @@ mod tests {
         assert!(deploy_container(&src, &dest, Some("copy")).is_err());
         assert!(remove_container(&deployed.dir).is_err());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deploy_uses_short_folder_for_long_names() {
+        let base = std::env::temp_dir().join(format!("tokentools-deploy-long-{}", now_nanos()));
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        for file in CONTAINER_FILES {
+            std::fs::write(src.join(file), b"x").expect("file");
+        }
+        std::fs::write(src.join("name.key"), build_name_key(b"orig")).expect("name.key");
+        let dest = base.join("dest");
+        let deployed = deploy_container(&src, &dest, Some("audit-test")).expect("deploy");
+        let folder = deployed
+            .dir
+            .file_name()
+            .expect("folder name")
+            .to_string_lossy()
+            .into_owned();
+        let base_name = folder
+            .strip_suffix(".000")
+            .expect("каталог контейнера оканчивается .000");
+        assert!(
+            base_name.len() <= 8,
+            "каталог {folder} длиннее 8 символов — CryptoPro HDIMAGE его не увидит"
+        );
+        assert_eq!(
+            parse_name_key(&std::fs::read(deployed.dir.join("name.key")).expect("name.key")),
+            Some("audit-test".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repair_renames_long_container_folders() {
+        let base = std::env::temp_dir().join(format!("tokentools-repair-{}", now_nanos()));
+        let long = base.join("1ee414f8-b564-46e0-a0eb-52b5b2820435 копия.000");
+        let non_ascii = base.join("ключ.000");
+        for dir in [&long, &non_ascii] {
+            std::fs::create_dir_all(dir).expect("dir");
+            for file in CONTAINER_FILES {
+                std::fs::write(dir.join(file), b"x").expect("file");
+            }
+            std::fs::write(dir.join("name.key"), build_name_key(b"orig")).expect("name.key");
+        }
+        let short = base.join("short.000");
+        std::fs::create_dir_all(&short).expect("короткий каталог не трогаем");
+        let renamed = repair_dir(&base).expect("repair");
+        assert_eq!(
+            renamed.len(),
+            2,
+            "длинный и не-ASCII каталоги должны быть переименованы"
+        );
+        for dir in [&long, &non_ascii] {
+            let (_, to) = renamed
+                .iter()
+                .find(|(from, _)| from == dir)
+                .unwrap_or_else(|| panic!("{} не переименован", dir.display()));
+            let folder = to
+                .file_name()
+                .expect("folder")
+                .to_string_lossy()
+                .into_owned();
+            let base_name = folder.strip_suffix(".000").expect(".000");
+            assert!(
+                base_name.is_ascii() && base_name.len() <= 8,
+                "каталог {folder} всё ещё длинный"
+            );
+            assert!(to.join("name.key").is_file(), "name.key сохранён");
+            assert!(!dir.exists(), "старый каталог удалён переименованием");
+        }
+        assert!(short.is_dir(), "короткий каталог не переименован");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn csp_name_comes_from_name_key() {
+        let dir = std::env::temp_dir().join(format!("tokentools-name-{}", now_nanos()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let container = StorageContainer {
+            name: "doc2560".to_string(),
+            dir: dir.clone(),
+            files: CONTAINER_FILES.len(),
+            volume: None,
+        };
+        assert_eq!(container.csp_name(), "\\\\.\\HDIMAGE\\doc2560");
+        std::fs::write(dir.join("name.key"), build_name_key("2816doc".as_bytes()))
+            .expect("name.key");
+        assert_eq!(container.csp_name(), "\\\\.\\HDIMAGE\\2816doc");
+        let flash = StorageContainer {
+            volume: Some("7EB2-EB0C".to_string()),
+            ..container
+        };
+        assert_eq!(flash.csp_name(), "\\\\.\\7EB2-EB0C\\2816doc");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
