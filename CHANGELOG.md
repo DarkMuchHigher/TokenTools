@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-12
+
 ### Добавлено
 
 - CLI: команда `repair` — переименовывает каталоги контейнеров в хранилище CSP, которые КриптоПро
@@ -20,6 +22,8 @@
 - `storage` и `unmount` определяют имя контейнера по `name.key`, а не по имени каталога.
 - GUI: страница «Установленные» переименована в «Хранилище»; списки переверстаны — усечение
   с подсказками, группировка контейнеров по считывателям, кнопки справа.
+- Имя контейнера из `name.key` читается один раз при сканировании — GUI больше не обращается
+  к файлу на каждом кадре.
 
 ### Исправлено
 
@@ -63,7 +67,8 @@
 - Первый выпуск: CLI и GUI, выгрузка контейнеров с токена, снятие неэкспортируемости через
   `p12utility`, сборки для Linux и Windows.
 
-[Unreleased]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/DarkMuchHigher/TokenTools/compare/v0.1.0...v0.2.0
