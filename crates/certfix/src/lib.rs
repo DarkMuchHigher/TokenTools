@@ -563,25 +563,41 @@ pub struct StorageContainer {
     pub dir: PathBuf,
     pub files: usize,
     pub volume: Option<String>,
+    /// Имя из `name.key`, прочитанное при сканировании: КриптоПро берёт имя
+    /// контейнера из файла, а не из имени каталога.
+    name_key: Option<String>,
 }
 
 impl StorageContainer {
     pub fn csp_name(&self) -> String {
-        let name = self.container_name().unwrap_or_else(|| self.name.clone());
+        let name = self.container_name().unwrap_or(&self.name);
         match &self.volume {
             Some(uuid) => format!("\\\\.\\{uuid}\\{name}"),
             None => format!("\\\\.\\HDIMAGE\\{name}"),
         }
     }
 
-    pub fn container_name(&self) -> Option<String> {
-        std::fs::read(self.dir.join("name.key"))
-            .ok()
-            .and_then(|data| parse_name_key(&data))
+    pub fn container_name(&self) -> Option<&str> {
+        self.name_key.as_deref()
     }
 
     pub fn is_complete(&self) -> bool {
         self.files == CONTAINER_FILES.len()
+    }
+}
+
+fn storage_container_of(dir: PathBuf, name: String, volume: Option<&str>) -> StorageContainer {
+    StorageContainer {
+        files: CONTAINER_FILES
+            .iter()
+            .filter(|file| dir.join(file).is_file())
+            .count(),
+        name_key: std::fs::read(dir.join("name.key"))
+            .ok()
+            .and_then(|data| parse_name_key(&data)),
+        name,
+        dir,
+        volume: volume.map(str::to_string),
     }
 }
 
@@ -760,7 +776,7 @@ pub fn unmount_container(name: &str) -> Result<PathBuf> {
     if !dir.is_dir()
         && let Some(found) = storage_containers()
             .into_iter()
-            .find(|c| c.volume.is_none() && c.container_name().as_deref() == Some(name))
+            .find(|c| c.volume.is_none() && c.container_name() == Some(name))
     {
         remove_container(&found.dir)?;
         return Ok(found.dir);
@@ -782,15 +798,7 @@ fn scan_containers(root: &Path, volume: Option<&str>, out: &mut Vec<StorageConta
         if !dir.is_dir() {
             continue;
         }
-        out.push(StorageContainer {
-            name: name.to_string(),
-            files: CONTAINER_FILES
-                .iter()
-                .filter(|file| dir.join(file).is_file())
-                .count(),
-            dir,
-            volume: volume.map(str::to_string),
-        });
+        out.push(storage_container_of(dir, name.to_string(), volume));
     }
 }
 
@@ -1156,20 +1164,18 @@ mod tests {
     fn csp_name_comes_from_name_key() {
         let dir = std::env::temp_dir().join(format!("tokentools-name-{}", now_nanos()));
         std::fs::create_dir_all(&dir).expect("dir");
-        let container = StorageContainer {
-            name: "doc2560".to_string(),
-            dir: dir.clone(),
-            files: CONTAINER_FILES.len(),
-            volume: None,
-        };
+        for file in CONTAINER_FILES {
+            std::fs::write(dir.join(file), b"x").expect("file");
+        }
+        let container = storage_container_of(dir.clone(), "doc2560".to_string(), None);
         assert_eq!(container.csp_name(), "\\\\.\\HDIMAGE\\doc2560");
+        assert_eq!(container.container_name(), None);
         std::fs::write(dir.join("name.key"), build_name_key("2816doc".as_bytes()))
             .expect("name.key");
-        assert_eq!(container.csp_name(), "\\\\.\\HDIMAGE\\2816doc");
-        let flash = StorageContainer {
-            volume: Some("7EB2-EB0C".to_string()),
-            ..container
-        };
+        let renamed = storage_container_of(dir.clone(), "doc2560".to_string(), None);
+        assert_eq!(renamed.container_name(), Some("2816doc"));
+        assert_eq!(renamed.csp_name(), "\\\\.\\HDIMAGE\\2816doc");
+        let flash = storage_container_of(dir.clone(), "doc2560".to_string(), Some("7EB2-EB0C"));
         assert_eq!(flash.csp_name(), "\\\\.\\7EB2-EB0C\\2816doc");
         let _ = std::fs::remove_dir_all(&dir);
     }

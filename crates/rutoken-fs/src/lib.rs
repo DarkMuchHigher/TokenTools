@@ -75,7 +75,7 @@ fn pin_state_from_sw(sw: u16) -> Option<PinState> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Container {
-    pub root: Vec<u16>,
+    root: Vec<u16>,
     pub folder: u16,
 }
 

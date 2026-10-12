@@ -1781,7 +1781,7 @@ impl App {
                     }
                     let name = container
                         .container_name()
-                        .unwrap_or_else(|| container.name.clone());
+                        .unwrap_or(container.name.as_str());
                     let csp = container.csp_name();
                     let place = match &container.volume {
                         None => "Хранилище КриптоПро".to_string(),
@@ -1799,7 +1799,7 @@ impl App {
                         .iter()
                         .find(|cert| {
                             cert.container.as_deref().is_some_and(|link| {
-                                link.contains(&container.name) || link.contains(&name)
+                                link.contains(&container.name) || link.contains(name)
                             })
                         })
                         .map(|cert| {
@@ -1812,8 +1812,8 @@ impl App {
                             egui::vec2(width, 0.0),
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
-                                ui.add(egui::Label::new(name.clone()).truncate())
-                                    .on_hover_text(&name);
+                                ui.add(egui::Label::new(name).truncate())
+                                    .on_hover_text(name);
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(csp.clone())

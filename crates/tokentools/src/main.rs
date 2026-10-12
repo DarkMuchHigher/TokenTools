@@ -572,7 +572,7 @@ fn cmd_storage() -> Result<()> {
     for container in &containers {
         let name = container
             .container_name()
-            .unwrap_or_else(|| container.name.clone());
+            .unwrap_or(container.name.as_str());
         let state = if container.is_complete() {
             "полный"
         } else {
