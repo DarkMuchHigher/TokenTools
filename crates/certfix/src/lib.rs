@@ -563,8 +563,6 @@ pub struct StorageContainer {
     pub dir: PathBuf,
     pub files: usize,
     pub volume: Option<String>,
-    /// Имя из `name.key`, прочитанное при сканировании: КриптоПро берёт имя
-    /// контейнера из файла, а не из имени каталога.
     name_key: Option<String>,
 }
 
