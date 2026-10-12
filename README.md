@@ -6,9 +6,16 @@
 
 <p align="center"><strong>Инструменты для работы с контейнерами КриптоПро на аппаратных токенах</strong></p>
 
+<p align="center">
+  <a href="https://github.com/DarkMuchHigher/TokenTools/actions/workflows/ci.yml"><img src="https://github.com/DarkMuchHigher/TokenTools/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/DarkMuchHigher/TokenTools/releases/latest"><img src="https://img.shields.io/github/v/release/DarkMuchHigher/TokenTools" alt="Последний релиз"></a>
+  <img src="https://img.shields.io/badge/rust-1.99-orange?logo=rust" alt="Rust 1.99">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/DarkMuchHigher/TokenTools" alt="Лицензия MIT"></a>
+</p>
+
 TokenTools читает контейнеры КриптоПро через PC/SC, выгружает файлы, разбирает сертификаты, проверяет контейнеры через CryptoPro CSP и запускает CertFix через `p12utility`.
 
-В составе проекта — CLI и нативный GUI на egui/eframe. Готовые сборки: [Releases](https://github.com/DarkMuchHigher/TokenTools/releases).
+В составе проекта — CLI и нативный GUI на egui/eframe. Готовые сборки: [Releases](https://github.com/DarkMuchHigher/TokenTools/releases). История версий — [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
 
@@ -23,6 +30,8 @@ TokenTools читает контейнеры КриптоПро через PC/SC
 - извлечение и установка сертификатов, экспорт в PEM;
 - просмотр личных сертификатов КриптоПро (хранилище `uMy`);
 - установка контейнера в хранилище КриптоПро или на флешку;
+- короткие каталоги контейнеров и команда `repair` для уже установленных;
+- привязка сертификата владельца к ключу в `uMy` (флаг `--link`);
 - диагностика окружения командой `doctor`.
 
 Файлы выгруженного контейнера:
@@ -115,6 +124,9 @@ cargo run --release -p tokentools -- fix ./dump/<container>
 # Контейнеры в хранилище КриптоПро и на флешках
 cargo run --release -p tokentools -- storage
 
+# Переименовать каталоги, которые КриптоПро не видит (> 8 символов или не-ASCII)
+cargo run --release -p tokentools -- repair
+
 # Установить контейнер в хранилище КриптоПро (HDIMAGE)
 cargo run --release -p tokentools -- deploy ./dump/<container> --name mykey --link
 
@@ -161,12 +173,12 @@ export TOKENTOOLS_PIN=87654321
 cargo run --release -p tokentools-gui
 ```
 
-Разделы: **Токен**, **Контейнер**, **Установленные**, **Сертификаты** и **Журнал**.
+Разделы: **Токен**, **Контейнер**, **Хранилище**, **Сертификаты** и **Журнал**.
 
 - **Токен**: PIN пользователя, список контейнеров, сохранение на диск. После неверного PIN автопоиск останавливается до нажатия «Прочитать токен».
 - **Контейнер**: проверка, снятие неэкспортируемости, сертификаты и установка в хранилище КриптоПро или на найденную флешку.
-- **Установленные**: контейнеры в хранилище КриптоПро и на флешках; проверка, установка сертификата, удаление.
-- **Сертификаты**: личные сертификаты из `uMy` с поиском.
+- **Хранилище**: ключевые контейнеры в хранилище КриптоПро и на флешках; видно, какой сертификат из `uMy` привязан к контейнеру; проверка, установка сертификата, удаление.
+- **Сертификаты**: публичные сертификаты из `uMy` с поиском; каждый ссылается на ключевой контейнер.
 
 Иконка в доке и меню (Linux): скопируйте `tokentools.desktop` в `~/.local/share/applications/`, а `tokentools.png` в `~/.local/share/icons/hicolor/128x128/apps/`. В релизных архивах оба файла лежат рядом с бинарниками.
 
@@ -176,14 +188,19 @@ cargo run --release -p tokentools-gui
 
 | Куда | Каталог | Имя в КриптоПро | Пароль при подписи |
 | --- | --- | --- | --- |
-| Хранилище (HDIMAGE) | `/var/opt/cprocsp/keys/$USER/<имя>.000` | `\\.\HDIMAGE\<имя>` | не нужен |
-| Флешка | `<корень тома>/<имя>.000` | `\\.\<UUID тома>\<имя>` | запрашивается |
+| Хранилище (HDIMAGE) | `/var/opt/cprocsp/keys/$USER/<каталог>.000` | `\\.\HDIMAGE\<имя>` | не нужен |
+| Флешка | `<корень тома>/<каталог>.000` | `\\.\<UUID тома>\<имя>` | запрашивается |
+
+Имя контейнера КриптоПро берёт из файла `name.key`, а не из имени каталога. Каталог в хранилище
+HDIMAGE не должен быть длиннее 8 символов, поэтому TokenTools создаёт короткий ASCII-каталог
+(`<имя>.000` для коротких имён, иначе `t….000`), а полное имя записывает в `name.key`.
+Каталоги, установленные ранее с длинными именами, переименовывает команда `repair`.
 
 Флешка определяется автоматически: подходят USB-тома, смонтированные в `/proc/mounts`. КриптоПро ищет контейнеры только в корне тома, поэтому установка в подпапку флешки отклоняется. Имя тома в КриптоПро совпадает с UUID из `/dev/disk/by-uuid`, например `7EB2-EB0C`.
 
 Имя контейнера должно быть уникальным. Если контейнер с таким же именем есть на подключённом токене, КриптоПро выберет токен и запросит PIN, поэтому для копий задавайте своё имя (`--name`).
 
-Флаг `--link` (`cryptcp -cspcert`) привязывает сертификат из контейнера к ключу в хранилище `uMy`. После этого можно подписывать по отпечатку:
+Флаг `--link` извлекает сертификат владельца из `header.key` и привязывает его к ключу в хранилище `uMy` (`certmgr -install -container`); рядом с контейнером остаётся `cert_exchange.cer`. После этого можно подписывать по отпечатку:
 
 ```bash
 csptest -lowsign -sign -in file.txt -out file.p7s -detached -my <отпечаток> -add -alg GOST12_256
@@ -216,7 +233,7 @@ csptest -lowsign -verify -in file.txt -signature file.p7s -detached -my <отп�
 | `rutoken-fs` | Обход файловой системы токена по APDU. |
 | `cryptopro-container` | Разбор имён, `header.key` и сертификатов. |
 | `certfix` | CryptoPro CSP, Wine/Flatpak, проверка и обработка контейнеров. |
-| `tokentools` | CLI: `list`, `doctor`, `dump`, `fix`, `verify`, `cert`, `storage`, `deploy`, `unmount`. |
+| `tokentools` | CLI: `list`, `doctor`, `dump`, `fix`, `verify`, `cert`, `storage`, `repair`, `deploy`, `unmount`. |
 | `tokentools-gui` | Desktop-интерфейс на egui/eframe. |
 
 ## Окружение
@@ -235,6 +252,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo build --workspace --release --locked
 ```
+
+Конвенции проекта и обязательные проверки — в [`AGENTS.md`](AGENTS.md).
 
 ## CI
 
