@@ -29,10 +29,8 @@ pub fn file_name_by_role(role: u8) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-pub fn container_dir_name(name: Option<&str>, folder: u16) -> String {
-    let sanitized: String = name
-        .unwrap_or_default()
-        .chars()
+pub fn sanitize_name(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_control() || c == '/' || c == '\\' {
                 '_'
@@ -40,7 +38,11 @@ pub fn container_dir_name(name: Option<&str>, folder: u16) -> String {
                 c
             }
         })
-        .collect();
+        .collect()
+}
+
+pub fn container_dir_name(name: Option<&str>, folder: u16) -> String {
+    let sanitized = sanitize_name(name.unwrap_or_default());
     let sanitized = sanitized.trim();
     if sanitized.is_empty() {
         format!("{folder:04x}")

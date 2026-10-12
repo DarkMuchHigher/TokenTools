@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use cryptopro_container::{
     CONTAINER_FILES, CertInfo, build_name_key, cp1251_to_string, is_container_dir, parse_name_key,
-    read_container, read_owner_cert_info,
+    read_container, read_owner_cert_info, sanitize_name,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,14 +21,17 @@ pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    #[allow(unused_mut)]
-    let mut cmd = Command::new(program);
+    #[cfg(not(windows))]
+    {
+        Command::new(program)
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new(program);
         cmd.creation_flags(0x0800_0000);
+        cmd
     }
-    cmd
 }
 
 fn decode_csp_output(bytes: &[u8]) -> String {
@@ -117,12 +120,6 @@ pub fn save_container(dest: &Path, folder: &str, files: &[(String, Vec<u8>)]) ->
     result.map(|()| out)
 }
 
-fn contains_success_marker(output: &[u8]) -> bool {
-    output
-        .windows(7)
-        .any(|w| w == b"\xf3\xf1\xef\xe5\xf8\xed\xee")
-}
-
 pub fn user_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -150,9 +147,6 @@ fn find_p12utility() -> Result<PathBuf> {
                 dir = d.parent().map(Path::to_path_buf);
             }
         }
-    }
-    if let Some(home) = user_home() {
-        candidates.push(home.join("wine-test").join("p12utility.win32.exe"));
     }
     candidates
         .into_iter()
@@ -393,10 +387,7 @@ pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
     let out = cmd.output().context("не удалось запустить p12utility")?;
     let output = command_output(&out);
     let succeeded = out.status.success()
-        && (contains_success_marker(&out.stdout)
-            || contains_success_marker(&out.stderr)
-            || output.contains("успешно")
-            || output.to_ascii_lowercase().contains("success"));
+        && (output.contains("успешно") || output.to_ascii_lowercase().contains("success"));
     let text = format!("$ {command_line}\n{output}");
     if !succeeded {
         if let Err(error) = restore_container(&container_dir, &backup) {
@@ -608,12 +599,10 @@ impl StorageContainer {
         self.files == CONTAINER_FILES.len()
     }
 
-    pub fn cn(&self) -> Option<&str> {
-        self.cert.as_ref()?.subject_cn.as_deref()
-    }
-
     pub fn display_name(&self) -> &str {
-        self.cn()
+        self.cert
+            .as_ref()
+            .and_then(|cert| cert.subject_cn.as_deref())
             .or(self.container_name())
             .unwrap_or(self.name.as_str())
     }
@@ -645,16 +634,7 @@ fn storage_container_of(dir: PathBuf, name: String, volume: Option<&str>) -> Sto
 }
 
 fn storage_name(name: &str) -> Result<String> {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || c == '/' || c == '\\' {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
+    let sanitized = sanitize_name(name);
     let sanitized = sanitized.trim();
     if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
         bail!("некорректное имя контейнера: {name}");
@@ -958,6 +938,16 @@ fn unique_storage_name() -> Result<String> {
     bail!("не удалось подобрать уникальное имя временного CSP-контейнера")
 }
 
+fn run_csptest(mut cmd: Command) -> Result<String> {
+    let command_line = describe_command(&cmd);
+    let out = cmd.output().context("не удалось запустить csptest")?;
+    let text = format!("$ {command_line}\n{}", command_output(&out));
+    if !out.status.success() {
+        bail!("csptest завершился с ошибкой\n{text}");
+    }
+    Ok(text)
+}
+
 pub fn verify_container(container_dir: &Path) -> Result<String> {
     let container_dir = canonical(container_dir).context("каталог контейнера не найден")?;
     if !is_container_dir(&container_dir) {
@@ -970,13 +960,7 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
         let mut cmd = command(find_csp_tool("csptest")?);
         cmd.args(["-keyset", "-check", "-container"])
             .arg(&container_dir);
-        let command_line = describe_command(&cmd);
-        let out = cmd.output().context("не удалось запустить csptest")?;
-        let text = format!("$ {command_line}\n{}", command_output(&out));
-        if !out.status.success() {
-            bail!("csptest завершился с ошибкой\n{text}");
-        }
-        return Ok(text);
+        return run_csptest(cmd);
     }
     let csptest = find_csp_tool("csptest")?;
     let name = unique_storage_name()?;
@@ -987,18 +971,12 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
         .context("временный контейнер не попал в хранилище CSP")?;
     let mut cmd = command(csptest);
     cmd.args(["-keyset", "-check", "-container"]).arg(csp_name);
-    let command_line = describe_command(&cmd);
-    let result = cmd.output().context("не удалось запустить csptest");
+    let result = run_csptest(cmd);
     let cleanup = remove_container(&deployed.dir);
-    let out = result?;
     if let Err(error) = cleanup {
         bail!("не удалось удалить временный CSP-контейнер: {error}");
     }
-    let text = format!("$ {command_line}\n{}", command_output(&out));
-    if !out.status.success() {
-        bail!("csptest завершился с ошибкой\n{text}");
-    }
-    Ok(text)
+    result
 }
 
 pub fn certmgr_install(
@@ -1177,7 +1155,12 @@ mod tests {
     fn decodes_cp1251_success_message() {
         let bytes = [0xf3, 0xf1, 0xef, 0xe5, 0xf8, 0xed, 0xee];
         assert_eq!(decode_csp_output(&bytes), "успешно");
-        assert!(contains_success_marker(&bytes));
+    }
+
+    #[test]
+    fn decoded_cp1251_success_is_recognized() {
+        let bytes = [0xf3, 0xf1, 0xef, 0xe5, 0xf8, 0xed, 0xee];
+        assert!(decode_csp_output(&bytes).contains("успешно"));
     }
 
     #[test]

@@ -444,6 +444,24 @@ fn fields(ui: &mut egui::Ui, palette: &Palette, rows: &[(&str, String, bool)]) {
     }
 }
 
+fn cert_fields(cert: &cryptopro_container::CertInfo) -> Vec<(&'static str, String, bool)> {
+    let period = match (&cert.not_before, &cert.not_after) {
+        (Some(from), Some(to)) => format!("с {from} по {to}"),
+        _ => String::new(),
+    };
+    vec![
+        (
+            "Издатель",
+            cert.issuer_cn.clone().unwrap_or_default(),
+            false,
+        ),
+        ("Серийный номер", cert.serial_hex.clone(), true),
+        ("Действует", period, false),
+        ("SHA-1", hex_lower(&cert.sha1), true),
+        ("SHA-256", hex_lower(&cert.sha256), true),
+    ]
+}
+
 fn cert_block(ui: &mut egui::Ui, palette: &Palette, title: &str, row: &CertRow, detailed: bool) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(title).strong().color(palette.text));
@@ -471,25 +489,7 @@ fn cert_block(ui: &mut egui::Ui, palette: &Palette, title: &str, row: &CertRow, 
     if !detailed {
         return;
     }
-    let period = match (&cert.not_before, &cert.not_after) {
-        (Some(from), Some(to)) => format!("с {from} по {to}"),
-        _ => String::new(),
-    };
-    fields(
-        ui,
-        palette,
-        &[
-            (
-                "Издатель",
-                cert.issuer_cn.clone().unwrap_or_default(),
-                false,
-            ),
-            ("Серийный номер", cert.serial_hex.clone(), true),
-            ("Действует", period, false),
-            ("SHA-1", hex_lower(&cert.sha1), true),
-            ("SHA-256", hex_lower(&cert.sha256), true),
-        ],
-    );
+    fields(ui, palette, &cert_fields(cert));
 }
 
 fn cert_row(ui: &mut egui::Ui, palette: &Palette, index: usize, cert: &certfix::StoreCert) {
@@ -747,14 +747,7 @@ fn container_details(ui: &mut egui::Ui, palette: &Palette, container: &certfix::
             cert.issuer_cn.clone().unwrap_or_default(),
             false,
         ));
-        rows.push(("Серийный номер", cert.serial_hex.clone(), true));
-        let period = match (&cert.not_before, &cert.not_after) {
-            (Some(from), Some(to)) => format!("с {from} по {to}"),
-            _ => String::new(),
-        };
-        rows.push(("Действует", period, false));
-        rows.push(("SHA-1", hex_lower(&cert.sha1), true));
-        rows.push(("SHA-256", hex_lower(&cert.sha256), true));
+        rows.extend(cert_fields(cert));
     }
     if container.chain > 0 {
         rows.push(("УЦ в цепочке", container.chain.to_string(), false));
@@ -986,7 +979,6 @@ struct App {
     installed: Vec<certfix::StorageContainer>,
     usb: Vec<certfix::UsbVolume>,
     keys_dir: Option<PathBuf>,
-    has_keys_dir: bool,
     remove_confirm: Option<PathBuf>,
     expanded: Option<PathBuf>,
     install_target: InstallTarget,
@@ -1035,7 +1027,6 @@ impl App {
             installed: Vec::new(),
             usb: Vec::new(),
             keys_dir: None,
-            has_keys_dir: false,
             remove_confirm: None,
             expanded: None,
             install_target: InstallTarget::Store,
@@ -1165,7 +1156,6 @@ impl App {
         self.installed = certfix::storage_containers();
         self.usb = certfix::usb_volumes();
         self.keys_dir = certfix::csp_keys_dir().ok();
-        self.has_keys_dir = self.keys_dir.is_some();
         self.remove_confirm = None;
         if let InstallTarget::Flash(uuid) = &self.install_target
             && !self.usb.iter().any(|volume| &volume.uuid == uuid)

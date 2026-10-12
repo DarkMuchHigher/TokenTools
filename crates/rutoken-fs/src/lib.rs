@@ -202,23 +202,6 @@ impl<'a> RutokenFs<'a> {
         self.select_by_id(0x3F00)
     }
 
-    fn select_parent(&self) -> Result<u16> {
-        let (_, sw) = self.transmit(&[0x00, 0xA4, 0x03, 0x00])?;
-        Ok(sw)
-    }
-
-    fn enum_first(&self) -> Result<Option<FileEntry>> {
-        let (resp, sw) = self.transmit(&[0x00, 0xA4, 0x00, 0x04, 0x00])?;
-        Self::entry_or_not_found(&resp, sw)
-    }
-
-    fn enum_next(&self, fid: u16) -> Result<Option<FileEntry>> {
-        let mut data = vec![0x02];
-        data.extend_from_slice(&fid.to_be_bytes());
-        let (resp, sw) = self.select_raw(0x00, 0x06, &data, 0x00)?;
-        Self::entry_or_not_found(&resp, sw)
-    }
-
     fn entry_or_not_found(resp: &[u8], sw: u16) -> Result<Option<FileEntry>> {
         if sw == SW_NOT_FOUND {
             return Ok(None);
@@ -238,7 +221,7 @@ impl<'a> RutokenFs<'a> {
         let mut out = Vec::with_capacity(size);
         while out.len() < size {
             let want = (size - out.len()).min(READ_CHUNK);
-            let le = if want == 256 { 0x00 } else { want as u8 };
+            let le = want as u8;
             let p1 = ((out.len() >> 8) & 0x7F) as u8;
             let p2 = (out.len() & 0xFF) as u8;
             let (resp, sw) = self.transmit(&[0x00, 0xB0, p1, p2, le])?;
@@ -255,16 +238,6 @@ impl<'a> RutokenFs<'a> {
             out.extend_from_slice(&resp);
         }
         Ok(out)
-    }
-
-    pub fn read_file(&self, fid: u16) -> Result<Vec<u8>> {
-        let entry = self
-            .select_by_id(fid)?
-            .ok_or_else(|| anyhow!("файл {fid:04X} не найден"))?;
-        if entry.size == 0 {
-            bail!("файл {fid:04X}: нулевой размер в FCP");
-        }
-        self.read_binary(entry.size)
     }
 
     pub fn containers(&self) -> Result<Vec<Container>> {
@@ -340,70 +313,6 @@ impl<'a> RutokenFs<'a> {
         Ok(files)
     }
 
-    pub fn walk(&self, max_depth: usize) -> Result<Vec<(Vec<u16>, Vec<FileEntry>)>> {
-        self.select_mf()?
-            .ok_or_else(|| anyhow!("MF (3F00) не выбран"))?;
-        let mut found = Vec::new();
-        self.walk_into(&[], &mut found, max_depth)?;
-        Ok(found)
-    }
-
-    fn walk_into(
-        &self,
-        path: &[u16],
-        found: &mut Vec<(Vec<u16>, Vec<FileEntry>)>,
-        max_depth: usize,
-    ) -> Result<()> {
-        if path.len() > max_depth {
-            return Ok(());
-        }
-        let entries = self.enum_current()?;
-        let (dirs, files): (Vec<FileEntry>, Vec<FileEntry>) =
-            entries.into_iter().partition(|e| e.is_df);
-        self.log(|| {
-            format!(
-                "/{}/ — {} файл(ов), {} пап(ок)",
-                label(path),
-                files.len(),
-                dirs.len()
-            )
-        });
-        if !files.is_empty() {
-            found.push((path.to_vec(), files));
-        }
-        for dir in dirs {
-            let mut child = path.to_vec();
-            child.push(dir.fid);
-            match self.select_path(&child)? {
-                Some(_) => self.walk_into(&child, found, max_depth)?,
-                None => self.log(|| format!("не удалось войти в папку {:04X}", dir.fid)),
-            }
-            if !path.is_empty() {
-                self.select_mf()?;
-                self.select_path(path)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn enum_current(&self) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
-        let Some(first) = self.enum_first()? else {
-            return Ok(entries);
-        };
-        let mut cursor = first.fid;
-        entries.push(first);
-        loop {
-            self.select_parent()?;
-            let Some(next) = self.enum_next(cursor)? else {
-                break;
-            };
-            cursor = next.fid;
-            entries.push(next);
-        }
-        Ok(entries)
-    }
-
     pub fn pin_state(&self, pin_ref: u8) -> Result<PinState> {
         let (_, sw) = self.transmit(&[0x00, 0x20, 0x00, pin_ref])?;
         pin_state_from_sw(sw).ok_or_else(|| anyhow!("VERIFY: неожиданный SW={sw:04x}"))
@@ -440,16 +349,6 @@ impl<'a> RutokenFs<'a> {
             },
         }
     }
-}
-
-fn label(path: &[u16]) -> String {
-    if path.is_empty() {
-        return "MF".to_string();
-    }
-    path.iter()
-        .map(|fid| format!("{fid:04X}"))
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 #[cfg(test)]
