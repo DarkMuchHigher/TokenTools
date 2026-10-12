@@ -135,7 +135,7 @@ pub struct ContainerCerts {
     pub owner: Vec<u8>,
     pub chain: Vec<Vec<u8>>,
 }
-fn header_certs(header: &[u8]) -> ContainerCerts {
+pub fn header_certs(header: &[u8]) -> ContainerCerts {
     let mut out = ContainerCerts::default();
     let outer = if !header.is_empty() && header[0] == 0x30 {
         tlv_content(header).to_vec()
@@ -183,6 +183,18 @@ fn header_certs(header: &[u8]) -> ContainerCerts {
 pub fn is_container_dir(dir: &Path) -> bool {
     CONTAINER_FILES.iter().all(|f| dir.join(f).exists())
 }
+
+pub fn owner_cert_info(header: &[u8]) -> Option<CertInfo> {
+    let owner = header_certs(header).owner;
+    if owner.is_empty() {
+        return None;
+    }
+    parse_cert(&owner).ok()
+}
+
+pub fn read_owner_cert_info(dir: &Path) -> Option<CertInfo> {
+    owner_cert_info(&std::fs::read(dir.join("header.key")).ok()?)
+}
 pub fn read_container(dir: &Path) -> Result<(Option<String>, ContainerCerts)> {
     if !dir.join("header.key").exists() {
         bail!(
@@ -200,6 +212,52 @@ pub fn read_container(dir: &Path) -> Result<(Option<String>, ContainerCerts)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_cert_info_reads_cn_from_header() {
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag, content.len() as u8];
+            out.extend_from_slice(content);
+            out
+        }
+        fn name(cn: &str) -> Vec<u8> {
+            let mut atv = tlv(0x06, &[0x55, 0x04, 0x03]);
+            atv.extend_from_slice(&tlv(0x0C, cn.as_bytes()));
+            tlv(0x30, &tlv(0x31, &tlv(0x30, &atv)))
+        }
+        let mut tbs_body = tlv(0x02, &[0x01, 0x02, 0x03]);
+        tbs_body.extend_from_slice(&tlv(0x30, &[]));
+        tbs_body.extend_from_slice(&name("ФНС"));
+        let mut validity = tlv(0x17, b"260101000000Z");
+        validity.extend_from_slice(&tlv(0x17, b"270101000000Z"));
+        tbs_body.extend_from_slice(&tlv(0x30, &validity));
+        tbs_body.extend_from_slice(&name("ПИТЕРСТРОЙ"));
+        tbs_body.extend_from_slice(&tlv(0x30, &[]));
+        let mut cert_body = tlv(0x30, &tbs_body);
+        cert_body.extend_from_slice(&tlv(0x30, &[]));
+        cert_body.extend_from_slice(&tlv(0x03, &[0x00, 0x01]));
+        let cert = tlv(0x30, &cert_body);
+        let header = tlv(0x30, &tlv(0x30, &tlv(0x85, &cert)));
+
+        let info = owner_cert_info(&header).expect("сертификат владельца разобран");
+        assert_eq!(info.subject_cn.as_deref(), Some("ПИТЕРСТРОЙ"));
+        assert_eq!(info.issuer_cn.as_deref(), Some("ФНС"));
+    }
+
+    #[test]
+    fn owner_cert_info_needs_an_owner_certificate() {
+        assert!(owner_cert_info(&[]).is_none());
+        assert!(owner_cert_info(&[0x30, 0x03, 0x30, 0x01, 0x00]).is_none());
+        let mut header = vec![0x30, 0x07, 0x30, 0x05, 0x85, 0x03, 0x30, 0x01, 0x00];
+        header.truncate(9);
+        assert!(owner_cert_info(&header).is_none());
+    }
+
+    #[test]
+    fn parse_name_key_reads_only_container_names() {
+        assert!(parse_name_key(&[]).is_none());
+        assert!(parse_name_key(&build_name_key(b"doc")).is_some());
+    }
 
     #[test]
     fn container_dir_name_prefers_container_name() {

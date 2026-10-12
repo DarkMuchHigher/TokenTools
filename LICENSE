@@ -1,3 +1,27 @@
+TokenTools — учебный проект.
+
+Код распространяется по лицензии MIT (ниже). Сторонние компоненты, с которыми работает
+проект (CryptoPro CSP, p12utility.win32.exe, драйверы и утилиты производителей токенов),
+в него не входят и лицензируются их правообладателями. Названия и товарные знаки
+принадлежат их владельцам и упомянуты только чтобы обозначить совместимость.
+
+Проект предназначен для обучения и исследований. Пользователь сам отвечает за соблюдение
+лицензий, правил организации и применимого законодательства.
+
+---
+
+TokenTools is an educational project.
+
+The code is distributed under the MIT license (below). The third-party components the project
+works with (CryptoPro CSP, p12utility.win32.exe, token drivers and vendor utilities) are not
+part of it and stay under their owners' licenses. Names and trademarks belong to their owners
+and appear here only to describe compatibility.
+
+The project is meant for learning and research. You are responsible for following the licenses,
+your organization's rules and applicable law.
+
+---
+
 MIT License
 
 Copyright (c) 2026 TokenTools contributors

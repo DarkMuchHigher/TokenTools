@@ -457,12 +457,12 @@ fn cmd_dump(dest: &Path, verbose: bool, pin: Option<&str>) -> Result<()> {
     Ok(())
 }
 fn cmd_fix(dir: &Path, cert: Option<PathBuf>) -> Result<()> {
-    let dir = dir.canonicalize().context("каталог контейнера не найден")?;
+    let dir = certfix::canonical(dir).context("каталог контейнера не найден")?;
     if !cryptopro_container::is_container_dir(&dir) {
         bail!("{}: неполный контейнер, нужны все 6 файлов", dir.display());
     }
     let cert = match cert {
-        Some(c) => c.canonicalize().context("сертификат не найден")?,
+        Some(c) => certfix::canonical(&c).context("сертификат не найден")?,
         None => {
             let (_, certs) = cryptopro_container::read_container(&dir)?;
             if certs.owner.is_empty() {
@@ -570,19 +570,34 @@ fn cmd_storage() -> Result<()> {
         return Ok(());
     }
     for container in &containers {
-        let name = container
-            .container_name()
-            .unwrap_or(container.name.as_str());
         let state = if container.is_complete() {
             "полный"
         } else {
             "неполный"
         };
         println!(
-            "  {} — {name} ({}/6 файлов, {state})",
+            "  {} — {} (файлов {}/6, {state})",
+            container.display_name(),
             container.csp_name(),
             container.files
         );
+        println!("      папка: {}", container.dir.display());
+        if let Some(logical) = container.container_name() {
+            println!("      имя в name.key: {logical}");
+        }
+        if let Some(cert) = &container.cert {
+            if let Some(issuer) = &cert.issuer_cn {
+                println!("      издатель: {issuer}");
+            }
+            if let (Some(from), Some(to)) = (&cert.not_before, &cert.not_after) {
+                println!("      действует: с {from} по {to}");
+            }
+            println!("      серийный номер: {}", cert.serial_hex);
+            println!("      SHA-1: {}", hex_lower(&cert.sha1));
+        }
+        if container.chain > 0 {
+            println!("      УЦ в цепочке: {}", container.chain);
+        }
     }
     Ok(())
 }
@@ -607,7 +622,7 @@ fn cmd_unmount(name: &str) -> Result<()> {
 }
 
 fn cmd_deploy(dir: &Path, dest: Option<&Path>, name: Option<&str>, link: bool) -> Result<()> {
-    let dir = dir.canonicalize().context("каталог контейнера не найден")?;
+    let dir = certfix::canonical(dir).context("каталог контейнера не найден")?;
     let dest = match dest {
         Some(dest) => dest.to_path_buf(),
         None => certfix::csp_keys_dir()?,

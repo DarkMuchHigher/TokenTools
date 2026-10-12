@@ -1,11 +1,35 @@
 use anyhow::{Context, Result, bail};
 use cryptopro_container::{
-    CONTAINER_FILES, build_name_key, cp1251_to_string, is_container_dir, parse_name_key,
-    read_container,
+    CONTAINER_FILES, CertInfo, build_name_key, cp1251_to_string, is_container_dir, parse_name_key,
+    read_container, read_owner_cert_info,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let path = path.canonicalize()?;
+    #[cfg(windows)]
+    if let Some(plain) = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|text| !text.starts_with("UNC\\"))
+    {
+        return Ok(PathBuf::from(plain));
+    }
+    Ok(path)
+}
+
+fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
 
 fn decode_csp_output(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| cp1251_to_string(bytes))
@@ -199,7 +223,7 @@ pub struct DependencyStatus {
 }
 
 fn flatpak_wine_available() -> bool {
-    Command::new("flatpak")
+    command("flatpak")
         .args(["info", "org.winehq.Wine"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -335,22 +359,20 @@ fn restore_container(container_dir: &Path, backup: &Path) -> Result<()> {
 }
 
 pub fn fix_container(container_dir: &Path, cert: &Path) -> Result<String> {
-    let container_dir = container_dir
-        .canonicalize()
-        .context("каталог контейнера не найден")?;
-    let cert = cert.canonicalize().context("сертификат не найден")?;
+    let container_dir = canonical(container_dir).context("каталог контейнера не найден")?;
+    let cert = canonical(cert).context("сертификат не найден")?;
     if !cert.is_file() {
         bail!("{}: это не файл сертификата", cert.display());
     }
-    let exe = sandbox_exe(&find_p12utility()?.canonicalize()?)?;
+    let exe = sandbox_exe(&canonical(&find_p12utility()?)?)?;
     let mut cmd;
     if cfg!(target_os = "windows") {
-        cmd = Command::new(&exe);
+        cmd = command(&exe);
     } else if command_available("wine") {
-        cmd = Command::new("wine");
+        cmd = command("wine");
         cmd.arg(&exe);
     } else if command_available("flatpak") && flatpak_wine_available() {
-        cmd = Command::new("flatpak");
+        cmd = command("flatpak");
         cmd.args(["run"]);
         cmd.arg(format!("--filesystem={}", container_dir.display()));
         if cert.parent() != container_dir.parent()
@@ -563,6 +585,9 @@ pub struct StorageContainer {
     pub dir: PathBuf,
     pub files: usize,
     pub volume: Option<String>,
+    pub cert: Option<CertInfo>,
+    pub chain: usize,
+    pub installed: Option<u64>,
     name_key: Option<String>,
 }
 
@@ -582,9 +607,22 @@ impl StorageContainer {
     pub fn is_complete(&self) -> bool {
         self.files == CONTAINER_FILES.len()
     }
+
+    pub fn cn(&self) -> Option<&str> {
+        self.cert.as_ref()?.subject_cn.as_deref()
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.cn()
+            .or(self.container_name())
+            .unwrap_or(self.name.as_str())
+    }
 }
 
 fn storage_container_of(dir: PathBuf, name: String, volume: Option<&str>) -> StorageContainer {
+    let chain = read_container(&dir)
+        .map(|(_, certs)| certs.chain.len())
+        .unwrap_or_default();
     StorageContainer {
         files: CONTAINER_FILES
             .iter()
@@ -593,6 +631,13 @@ fn storage_container_of(dir: PathBuf, name: String, volume: Option<&str>) -> Sto
         name_key: std::fs::read(dir.join("name.key"))
             .ok()
             .and_then(|data| parse_name_key(&data)),
+        cert: read_owner_cert_info(&dir),
+        chain,
+        installed: std::fs::metadata(&dir)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|since| since.as_secs()),
         name,
         dir,
         volume: volume.map(str::to_string),
@@ -627,17 +672,95 @@ fn needs_short_dir(name: &str) -> bool {
     name.len() > SHORT_DIR_MAX || !name.is_ascii()
 }
 
-fn short_dir_name(dest: &Path, name: &str) -> Result<String> {
-    if !needs_short_dir(name) {
-        return Ok(name.to_string());
+const TRANSLIT: [(char, &str); 33] = [
+    ('а', "a"),
+    ('б', "b"),
+    ('в', "v"),
+    ('г', "g"),
+    ('д', "d"),
+    ('е', "e"),
+    ('ё', "e"),
+    ('ж', "zh"),
+    ('з', "z"),
+    ('и', "i"),
+    ('й', "y"),
+    ('к', "k"),
+    ('л', "l"),
+    ('м', "m"),
+    ('н', "n"),
+    ('о', "o"),
+    ('п', "p"),
+    ('р', "r"),
+    ('с', "s"),
+    ('т', "t"),
+    ('у', "u"),
+    ('ф', "f"),
+    ('х', "h"),
+    ('ц', "c"),
+    ('ч', "ch"),
+    ('ш', "sh"),
+    ('щ', "sch"),
+    ('ъ', ""),
+    ('ы', "y"),
+    ('ь', ""),
+    ('э', "e"),
+    ('ю', "yu"),
+    ('я', "ya"),
+];
+
+const ORG_FORMS: [&str; 12] = [
+    "ооо", "оао", "зао", "пао", "ао", "ип", "гуп", "муп", "llc", "ltd", "inc", "jsc",
+];
+
+fn slug_from_name(name: &str) -> String {
+    let lowered = name.to_lowercase();
+    let mut rest = lowered.trim_start();
+    for form in ORG_FORMS {
+        if let Some(tail) = rest.strip_prefix(form) {
+            rest = tail;
+            break;
+        }
     }
+    let mut out = String::with_capacity(rest.len());
+    for c in rest.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if let Some((_, latin)) = TRANSLIT.iter().find(|(cyrillic, _)| *cyrillic == c) {
+            out.push_str(latin);
+        }
+    }
+    out
+}
+
+fn short_dir_name(dest: &Path, source: &str) -> Result<String> {
+    let slug = slug_from_name(source);
+    let base = if slug.is_empty() {
+        verify_name(0)
+    } else {
+        slug[..slug.len().min(SHORT_DIR_MAX)].to_string()
+    };
     for attempt in 0..100 {
-        let candidate = verify_name(attempt);
+        let candidate = if attempt == 0 {
+            base.clone()
+        } else {
+            let suffix = attempt.to_string();
+            let keep = SHORT_DIR_MAX.saturating_sub(suffix.len());
+            format!("{}{suffix}", &base[..base.len().min(keep)])
+        };
         if !dest.join(format!("{candidate}.000")).exists() {
             return Ok(candidate);
         }
     }
-    bail!("не удалось подобрать короткое имя каталога для {name}")
+    bail!("не удалось подобрать имя каталога для {source}")
+}
+
+fn container_with_name(dest: &Path, name: &str) -> Option<PathBuf> {
+    let mut found = Vec::new();
+    scan_containers(dest, None, &mut found);
+    found
+        .into_iter()
+        .find(|container| container.container_name() == Some(name))
+        .map(|container| container.dir)
 }
 
 fn repair_dir(keys: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
@@ -654,7 +777,10 @@ fn repair_dir(keys: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
         if !dir.is_dir() || !needs_short_dir(base) || !is_container_dir(&dir) {
             continue;
         }
-        let target = keys.join(format!("{}.000", short_dir_name(keys, base)?));
+        let source = read_owner_cert_info(&dir)
+            .and_then(|cert| cert.subject_cn)
+            .unwrap_or_else(|| base.to_string());
+        let target = keys.join(format!("{}.000", short_dir_name(keys, &source)?));
         std::fs::rename(&dir, &target)
             .with_context(|| format!("не удалось переименовать {}", dir.display()))?;
         renamed.push((dir, target));
@@ -710,7 +836,17 @@ pub fn deploy_container(src: &Path, dest: &Path, name: Option<&str>) -> Result<D
         .with_context(|| format!("не удалось создать {}", dest.display()))?;
     let canonical = dest.canonicalize()?;
     let target = resolve_target(&canonical)?;
-    let dir = canonical.join(format!("{}.000", short_dir_name(&canonical, &name)?));
+    if let Some(existing) = container_with_name(&canonical, &name) {
+        bail!(
+            "контейнер с именем «{name}» уже установлен: {}; задайте другое имя (--name) \
+             или удалите лишний",
+            existing.display()
+        );
+    }
+    let source = read_owner_cert_info(src)
+        .and_then(|cert| cert.subject_cn)
+        .unwrap_or_else(|| name.clone());
+    let dir = canonical.join(format!("{}.000", short_dir_name(&canonical, &source)?));
     if dir.exists() {
         bail!("{} уже существует", dir.display());
     }
@@ -823,9 +959,7 @@ fn unique_storage_name() -> Result<String> {
 }
 
 pub fn verify_container(container_dir: &Path) -> Result<String> {
-    let container_dir = container_dir
-        .canonicalize()
-        .context("каталог контейнера не найден")?;
+    let container_dir = canonical(container_dir).context("каталог контейнера не найден")?;
     if !is_container_dir(&container_dir) {
         bail!(
             "{}: неполный контейнер, нужны все 6 файлов",
@@ -833,7 +967,7 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
         );
     }
     if cfg!(target_os = "windows") {
-        let mut cmd = Command::new(find_csp_tool("csptest")?);
+        let mut cmd = command(find_csp_tool("csptest")?);
         cmd.args(["-keyset", "-check", "-container"])
             .arg(&container_dir);
         let command_line = describe_command(&cmd);
@@ -851,7 +985,7 @@ pub fn verify_container(container_dir: &Path) -> Result<String> {
         .csp_name
         .clone()
         .context("временный контейнер не попал в хранилище CSP")?;
-    let mut cmd = Command::new(csptest);
+    let mut cmd = command(csptest);
     cmd.args(["-keyset", "-check", "-container"]).arg(csp_name);
     let command_line = describe_command(&cmd);
     let result = cmd.output().context("не удалось запустить csptest");
@@ -872,7 +1006,7 @@ pub fn certmgr_install(
     container: Option<&str>,
     store: &str,
 ) -> Result<(String, bool)> {
-    let mut cmd = Command::new(find_csp_tool("certmgr")?);
+    let mut cmd = command(find_csp_tool("certmgr")?);
     cmd.args(["-install", "-file"]).arg(cert);
     if let Some(c) = container {
         cmd.args(["-container", c]);
@@ -897,7 +1031,7 @@ pub struct StoreCert {
 }
 
 pub fn certmgr_list(store: &str) -> Result<Vec<StoreCert>> {
-    let output = Command::new(find_csp_tool("certmgr")?)
+    let output = command(find_csp_tool("certmgr")?)
         .args(["-list", "-store", store])
         .output()
         .context("не удалось запустить certmgr")?;
@@ -989,6 +1123,55 @@ pub fn cn_from_dn(dn: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_from_name_drops_org_form_and_transliterates() {
+        assert_eq!(slug_from_name("ООО \"ПИТЕРСТРОЙ\""), "piterstroy");
+        assert_eq!(slug_from_name("ООО «Ромашка»"), "romashka");
+        assert_eq!(slug_from_name("Ключ Ивана"), "klyuchivana");
+        assert_eq!(slug_from_name("doc2560"), "doc2560");
+        assert_eq!(slug_from_name("   "), "");
+    }
+
+    #[test]
+    fn short_dir_name_truncates_and_resolves_collisions() {
+        let base = std::env::temp_dir().join(format!("tokentools-slug-{}", now_nanos()));
+        std::fs::create_dir_all(&base).expect("временный каталог");
+        assert_eq!(
+            short_dir_name(&base, "ООО ПИТЕРСТРОЙ").expect("имя каталога"),
+            "piterstr"
+        );
+        std::fs::create_dir_all(base.join("piterstr.000")).expect("занятый каталог");
+        assert_eq!(
+            short_dir_name(&base, "ООО ПИТЕРСТРОЙ").expect("имя каталога"),
+            "piterst1"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deploy_refuses_second_container_with_same_name() {
+        let base = std::env::temp_dir().join(format!("tokentools-dupe-{}", now_nanos()));
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).expect("каталог контейнера");
+        for file in CONTAINER_FILES {
+            std::fs::write(src.join(file), b"x").expect("файл контейнера");
+        }
+        std::fs::write(src.join("name.key"), build_name_key(b"same")).expect("name.key");
+        let dest = base.join("dest");
+        let first = deploy_container(&src, &dest, Some("same")).expect("первая установка");
+        let second = deploy_container(&src, &dest, Some("same"));
+        let error = second.expect_err("повторная установка того же имени запрещена");
+        assert!(
+            error.to_string().contains("уже установлен"),
+            "ошибка должна указывать на занятое имя: {error}"
+        );
+        assert!(
+            error.to_string().contains(&first.dir.display().to_string()),
+            "ошибка должна показывать каталог: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn decodes_cp1251_success_message() {
