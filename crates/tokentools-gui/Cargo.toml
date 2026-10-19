@@ -7,7 +7,7 @@ readme = "../../README.md"
 description = "GUI TokenTools: выгрузка контейнеров с токена и снятие неэкспортируемости"
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = [
+eframe = { version = "0.37", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "glow",
